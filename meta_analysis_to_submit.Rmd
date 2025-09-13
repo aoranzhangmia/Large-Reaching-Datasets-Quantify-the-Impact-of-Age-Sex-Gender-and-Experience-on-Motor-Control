@@ -1,0 +1,3020 @@
+---
+title: "meta_analysis_r"
+author: "Aoran Zhang"
+date: "2024-07-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(brms)
+library(readr)
+library(dplyr)
+library(lavaan)
+library(tidyr)
+library(rstan)
+library(cmdstanr)
+library(ggplot2)
+library(bayesplot)
+library(patchwork)
+library(cowplot)
+# plot theme
+rm(list = ls())
+library(lemon)
+library(stringr)
+library(ggpubr)
+library(RColorBrewer)
+library(BAMBI)
+library(viridis)
+library(ggpubr)
+library(tidyverse)
+library(psych)
+library(car)
+library(plotrix)
+library(loo)
+library(fitdistrplus)
+
+
+call_aesthethics <- function(text_size){
+  
+  th <- theme(   panel.grid.major = element_blank(),
+                 panel.grid.minor = element_blank(),
+                 panel.border = element_blank(),
+                 panel.background = element_blank(),
+                 axis.line = element_line(size = 0.5), 
+                 legend.position = 'right', 
+                 legend.text = element_text(size= text_size, family="Helvetica"),
+                 text = element_text(size= text_size, family="Helvetica"), 
+                 strip.text.x = element_text(size = rel(0.90)), 
+                 strip.text.y = element_text(size = rel(0.90)), 
+                 axis.title.x = element_text(vjust=-0.3), 
+                 plot.title = element_text(hjust = 0.5, vjust = 0), 
+                 axis.ticks = element_line(size = 0.4), 
+                 axis.text.x.bottom  = element_text(size = rel(0.90), margin = unit(c(t = 2.5, r = 0, b = 0, l = 0), "mm")),
+                 axis.title.y = element_text(vjust = 1),
+                 axis.text.y = element_text(size = rel(0.90), margin = unit(c(t = 0, r = 2.5, b = 0, l = 0), "mm")),
+                 axis.ticks.length = unit(-1.2, "mm"),
+                 axis.text.x.top = element_text(size = rel(0.90), margin = unit(c(t = 0, r = 0, b = 2.5, l = 0), "mm")))
+  
+  return(th)
+}
+
+th <- call_aesthethics(14)
+```
+
+# Nemo Data Process
+```{r Extract HA and sqrt and exclude 935}
+setwd("~/Desktop/Research/kinematic data/metadata")
+nemo1 <-  read_csv("nemo_dem_ha.csv")
+nemo1
+nemo1 <- nemo1[,c('participant','Age','Sex','Handedness','HAvar_B1_baseline')]
+nemo1$RT <- vector(mode = "numeric", length = dim(nemo1)[1])
+nemo1$MT <- vector(mode = "numeric", length = dim(nemo1)[1])
+nemo1 = nemo1[-which(nemo1$participant == 935),]
+nemo1$Sex = gsub("Female", "F", nemo1$Sex)
+nemo1$Sex = gsub("Male", "M", nemo1$Sex)
+nemo1$Handedness = gsub("Right", "R", nemo1$Handedness)
+nemo1$Handedness = gsub("Left", "L", nemo1$Handedness)
+names(nemo1)[names(nemo1) == "HAvar_B1_baseline"] <- "HA"
+nemo1$HA = sqrt(nemo1$HA) 
+nemo1 = nemo1[nemo1$Handedness %in% c('L', 'R'),]
+```
+
+```{r Read and Process File}
+str.to.vec <- function(x){
+  clean_str <- gsub("array\\('f', \\[|\\])|\\s+", "", x)
+  str_list <- strsplit(clean_str, ",")[[1]]
+  numeric_vector <- as.numeric(str_list)
+  return(numeric_vector)
+}
+
+read.process.file <- function(x){
+  dir_path <- '00_Ruitenberg_Nemo_rawfiles/'
+  file_pattern <- paste0(as.character(x), '_2020_okt_.*\\.csv$')
+  file_name <- list.files(path = dir_path, pattern = file_pattern, full.names = TRUE)
+  
+  if (length(file_name) == 0) {
+    warning(cat("No file matching the pattern found for ", as.character(x), ''))
+    return(NULL)
+  }
+
+  subject <- read.csv(file_name[1])
+  subject <- subject[8:15,]
+  subject$joyx <- lapply(subject$joyx, str.to.vec)
+  subject$joyy <- lapply(subject$joyy, str.to.vec)
+  subject$time <- lapply(subject$time, str.to.vec)
+  subject$time <- lapply(subject$time, FUN = function(x){x * 1000})
+  subject$dist <- lapply(1:8, function(x){(sqrt(subject$joyx[[x]]^2 + subject$joyy[[x]]^2))})
+  subject$dist2target <- lapply(1:8, function(x){
+    (sqrt((subject$joyx[[x]] - subject$xPos[x])^2 +
+            (subject$joyy[[x]] - subject$yPos[x])^2))})
+  return(subject)
+}
+
+get.samp.list <- function(x){
+  all_sample$x <- read.process.file(x)
+}
+```
+
+```{r Apply file processing}
+subect.100 <- read.process.file(852)
+all_sample_df <- lapply(nemo1$participant, FUN = function(x){read.process.file(x)})
+all_sample_df[[1]]
+
+do.call(rbind, lapply(
+  as.vector(head(nemo1$participant, 6)), 
+  function(i) {
+  do.call(rbind, lapply(1:8, function(j) {
+    data.frame(
+      time = all_sample_df[[i]]$time[[j]],
+      dist = all_sample_df[[i]]$dist[[j]],
+      sample = factor(i),
+      trial = factor(j),
+      id = paste(i, j, sep = "_")
+    )
+  }))
+})) %>%
+  ggplot(aes(x = time, y = dist, color = sample, group = id)) +
+  geom_line(alpha = 0.3) + geom_point(alpha = 0.5, size = 0.1) +
+  theme_minimal()
+```
+
+
+```{r Get reaction and movement time}
+get_mode <- function(v) {
+  uniq_v <- unique(v)
+  uniq_v[which.max(tabulate(match(v, uniq_v)))]
+}
+
+
+get_mode <- function(v) {
+  uniq_v <- unique(v)
+  uniq_v[which.max(tabulate(match(v, uniq_v)))]
+}
+
+process.time <- function(x, tolerance = 0.25) {
+  time = x$time[[1]]
+  joyx = x$joyx[[1]]
+  joyy = x$joyy[[1]]
+  dist = x$dist[[1]]
+  dist.target = x$dist2target[[1]]
+  
+  react.trial = which(dist >= 1/12)[1]
+  react.time = time[react.trial]
+  
+  move.trial <- which(dist.target <= tolerance)[1]
+  move.time = time[move.trial] - react.time
+  return(c(react.time, move.time))
+}
+
+get.react <- function(df){
+  df = sapply(1:8, function(x){process.time(df[x,])})[1,]
+  df = na.omit(df)
+  return(mean(df))
+}
+
+get.move <- function(df){
+  df = sapply(1:8, function(x){process.time(df[x,])})[2,]
+  df = na.omit(df)
+  return(mean(df))
+}
+
+has.na <- function(df, tolerance = 5){
+  # print(length(sapply(1:8, function(x){process.time(df[x,])})[2,]) )
+  return(
+    min(
+           length(na.omit(sapply(1:8, function(x){process.time(df[x,])})[2,])), 
+      (
+         length(na.omit(sapply(1:8, function(x){process.time(df[x,])})[2,]))))
+    )
+}
+```
+
+```{r}
+valid_participants <- which(nemo1$na == FALSE)
+
+get.all.trials <- function(df) {
+  react_times <- sapply(1:8, function(x) { process.time(df[x,]) })[1,]
+  move_times <- sapply(1:8, function(x) { process.time(df[x,]) })[2,]
+
+  trial_data <- data.frame(
+    trial = 1:8,
+    RT = react_times,
+    MT = move_times
+    # HA = HA
+  )
+  
+  trial_data <- na.omit(trial_data)
+  
+  return(trial_data)
+}
+
+all_trial_data <- list()
+
+for (i in valid_participants) {
+  participant_trials <- get.all.trials(all_sample_df[[i]])
+  
+  participant_trials$Participant <- nemo1$participant[i]
+  participant_trials$Age <- nemo1$Age[i]
+  participant_trials$Sex <- nemo1$Sex[i]
+  participant_trials$Handedness <- nemo1$Handedness[i]
+  participant_trials$HA <- nemo1$HA[i]
+
+  all_trial_data[[i]] <- participant_trials
+}
+
+nemo_all_trials <- do.call(rbind, all_trial_data[valid_participants])
+nemo_all_trials
+rownames(nemo_all_trials) <- NULL
+nemo_all_trials
+head(nemo_all_trials)
+nemo_all_trials
+write.csv(nemo_all_trials, "nemo_trial.csv", row.names = FALSE)
+```
+
+
+```{r}
+nemo1$RT <- sapply(1:length(nemo1$participant), FUN =function(x){get.react(all_sample_df[[x]])})
+nemo1$MT <- sapply(1:length(nemo1$participant), FUN = function(x){get.move(all_sample_df[[x]])})
+nemo1$NTrial <- sapply(1:length(nemo1$participant), FUN = function(x){has.na(all_sample_df[[x]])})
+nemo1
+nemo1
+write.csv(nemo1, "nemo.csv", row.names = FALSE)
+```
+
+
+# Sensor Data Process
+```{r}
+library(dplyr)
+my.data <- read.csv("test_my_brain/TestmybrainData_30May2024.csv", header = TRUE) 
+
+my.demo.data <-  read.csv("test_my_brain/TestmybrainData_24May2024_demo.csv", header = TRUE) 
+
+my.all.data <- full_join(my.data, my.demo.data, by = "Subject.ID")
+
+my.all.data <- my.all.data %>%
+  filter(sex %in% c("male", "female")) %>%                     
+  filter(mousetype %in% c("optical", "trackpad")) %>%          
+  filter(Handedness %in% c("righth", "lefth")) %>%             
+  filter(gameIndex == "easy") %>%                             
+  filter(repeat. == "First Time") %>%                         
+  filter(!is.na(Age)) %>%                                     
+  filter(!is.na(suppressWarnings(as.numeric(as.character(Age))))) %>%  
+  mutate(                                                     
+    videogames = case_when(
+      videogames == "Strongly Agree" ~ 2,
+      videogames == "Agree" ~ 1,
+      videogames == "Neutral" ~ 0,
+      videogames == "Disagree" ~ -1,
+      videogames == "Strongly Disagree" ~ -2,
+      TRUE ~ NA
+    )
+  ) %>%
+  mutate(                                                     
+    Age = as.numeric(Age),
+    sex = as.numeric(factor(sex)),
+    Handedness = as.numeric(factor(Handedness)),
+    mousetype = as.numeric(factor(mousetype)),
+    videogames = as.numeric(videogames),
+    ComputerUsage = as.numeric(ComputerUsage)
+  ) %>%
+  filter(Age >= 18 & Age <= 100) %>%                          
+  filter(!is.na(ComputerUsage)) %>%                            
+  filter(!is.na(videogames)) %>%                               
+  filter(NeuroDisease == "No") %>%                             
+  mutate(vision = as.numeric(as.factor(vision)))               
+my.all.data
+
+my.all.data.sum <- my.all.data %>%
+  mutate(
+    Hand = Hand.Angle - Target.Angle,                           
+    Hand_pro = case_when(                                     
+      Hand >= 180 ~ Hand - 360,
+      Hand < -180 ~ Hand + 360,
+      TRUE ~ Hand
+    )
+  ) %>%
+  filter(Trial.Number <= 30 & Trial.Number >= 10) %>%                               
+  group_by(Subject.ID, Age, sex, Handedness, mousetype, videogames, ComputerUsage, Sleep, vision) %>%
+  summarise(
+    HA = sd(Hand_pro, na.rm = TRUE),                          
+    RT = mean(RT, na.rm = TRUE),                              
+    MT = mean(MT, na.rm = TRUE)                              
+  ) %>%
+  ungroup() %>% dplyr::select(-Subject.ID)                                         
+
+my.all.data.sum <- my.all.data.sum %>% rename(Sex = sex)
+write.csv(my.all.data.sum, "sensor_processed_data.csv")
+```
+
+# Cambridge Data Process
+```{r}
+demo_cam = read.csv("camcan1522/dataman/useraccess/processed/Jonathan_Tsay_2067/CopyOfstandard_data.csv")
+demo_cam
+raw_cam = read.table("camcan1522/cc700-scored/MotorLearning/release001/summary/CopyOfMotorLearning_summary_table_only.txt",
+                   header = TRUE, "\t")
+raw_cam = raw_cam[,c('CCID', 'ReactionTimeMean', 'LatePreExposureMovementTimeMean', 'LatePreExposureTrajectoryErrorSD')]
+nrow(raw_cam)
+colnames(raw_cam) = c('CCID', 'RT', 'MT', 'HA')
+filtered_demo_cam <- demo_cam %>%
+  filter(CCID %in% raw_cam$CCID)
+filtered_demo_cam <- demo_cam[demo_cam$CCID %in% raw_cam$CCID, c('CCID', 'Age','Sex')]
+combined_cam = inner_join(filtered_demo_cam, raw_cam, by = "CCID")
+nrow(combined_cam)
+cam <- combined_cam %>%
+  mutate(Sex = case_when(
+    Sex == "FEMALE" ~ "F",
+    Sex == "MALE" ~ "M",
+    TRUE ~ Sex  
+  ))
+
+raw_cam <- cam
+(cam <- cam %>%
+  mutate(CCID = row_number()))
+cam$RT = 1000 * cam$RT
+cam$MT = 1000 * cam$MT
+cam
+raw_cam
+```
+
+
+# Read and Process Data
+```{r Read and Process Data}
+# origin_nemo <- nemo
+kinarm <- read_csv("kinarm_processed.csv")[,c("...1", 'Age', 'Sex', 'Handedness', 'NTrials', 'MT', 'RT', 'HA')]
+kinarm$MT <- (kinarm$MT) * 1000
+kinarm$RT <- (kinarm$RT) * 1000
+kinarm = kinarm[kinarm$Handedness %in% c('L', 'R'),]
+kinarm$Handedness <- as.factor(kinarm$Handedness)
+kinarm$Sex <- as.factor(kinarm$Sex)
+kinarm$HA = kinarm$HA * 180 / pi
+levels(kinarm$Sex) <- c("F", "M")
+
+sensor <- read_csv("sensor_processed_data.csv")[,c("...1", 'Age', 'Sex', 'Handedness', 'MT', 'RT', 'HA')]
+sensor$Sex <- factor(sensor$Sex, levels = c(1, 2), labels = c("F", "M"))
+sensor$Handedness <- factor(sensor$Handedness, levels = c(1, 2), labels = c("L", "R"))
+sensor$HA = abs(sensor$HA)
+levels(sensor$Sex) <- c("F", "M")
+sensor = na.omit(sensor)
+
+nemo <- read_csv("nemo.csv")[,c("participant", 'Age', 'Sex', 'Handedness', 
+                                'HA','RT', 'MT', 'NTrial')]
+nemo = nemo[nemo$Handedness %in% c('L', 'R'),]
+nemo$Sex <- as.factor(nemo$Sex)
+nemo$Handedness <- as.factor(nemo$Handedness)
+
+cam$Sex <- as.factor(cam$Sex)
+
+levels(sensor$Sex) <- c("F", "M")
+levels(nemo$Sex) <- c("F", "M")
+levels(cam$Sex) <- c("F", "M")
+
+colnames(kinarm) <- c("SubjectID", 'Age', 'Sex/Gender', 'Handedness', 'NTrials', 'MT','RT', 'HA')
+
+colnames(sensor) <- c("SubjectID", 'Age', 'Sex/Gender', 'Handedness', 'MT','RT', 'HA')
+colnames(nemo) <- c("SubjectID", 'Age', 'Sex/Gender', 'Handedness', 'HA','RT', 'MT', 'NTrial')
+colnames(cam) <- c("SubjectID", 'Age', 'Sex/Gender', 'RT','MT', 'HA')
+
+sensor = na.omit(sensor)
+kinarm = na.omit(kinarm)
+nemo = na.omit(nemo)
+cam = na.omit(cam)
+
+filter_df <- function(x, out_excl = TRUE){
+  x <- x[x$Age >= 18,]
+  if (out_excl){
+    quantile_lower_RT <- quantile(x$RT, 0.0)
+    quantile_upper_RT <- quantile(x$RT, 0.995)
+  
+    quantile_lower_MT <- quantile(x$MT, 0.0)
+    quantile_upper_MT <- quantile(x$MT, 0.995)
+  
+    quantile_lower_HA <- quantile(x$HA, 0.0)
+    quantile_upper_HA <- quantile(x$HA, 0.995)
+    #
+    filtered_data <- x[x$RT >= quantile_lower_RT & x$RT <= quantile_upper_RT &
+                       x$MT >= quantile_lower_MT & x$MT <= quantile_upper_MT &
+                       x$HA >= quantile_lower_HA & x$HA <= quantile_upper_HA, ]
+    return(filtered_data)
+  }
+  return(x)
+}
+
+
+sensor <- filter_df(sensor)
+kinarm <- filter_df(kinarm)
+nemo <- filter_df(nemo)
+cam <- filter_df(cam)
+```
+
+## Add Trial Number
+```{r}
+kinarm$NTrials <- as.integer(kinarm$NTrials)
+sensor$NTrials <- rep(20L, nrow(sensor))
+nemo$NTrials <- as.integer(nemo$NTrial)
+cam$NTrials <- rep(24L, nrow(cam))
+```
+
+
+## Combine Data
+```{r Combind Data}
+kinarm$Study <- 'Study 1'
+sensor$Study <- 'Study 2'
+nemo$Study <- 'Study 3'
+cam$Study <- 'Study 4'
+
+kinarm1$Study <- 'Study 1'
+nemo1$Study <- 'Study 3'
+cam1$Study <- 'Study 4'
+sensor1$Study <- 'Study 2'
+
+combined_data <- bind_rows(
+  kinarm, 
+  sensor,
+  nemo,
+  cam
+)
+combined_data$Study = factor(combined_data$Study, ordered = TRUE)
+combined_data
+
+```
+
+```{r}
+# ============================
+# Power / Effect Size Analysis
+# ============================
+
+# Packages ----
+required_pkgs <- c("tidyverse", "metafor", "meta", "broom")
+to_install <- setdiff(required_pkgs, installed.packages()[, "Package"])
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+invisible(lapply(required_pkgs, library, character.only = TRUE))
+
+# I/O ----
+infile  <- "benchmark.csv"       # <-- your attached file
+outdir  <- "analysis_results"
+if (!dir.exists(outdir)) dir.create(outdir)
+
+# Read + basic hygiene ----
+raw <- read.csv(infile, stringsAsFactors = FALSE)
+df  <- raw %>%
+  mutate(
+    Study = as.character(Study),
+    Age   = suppressWarnings(as.numeric(Age))
+  )
+
+# Detect which outcomes are available
+candidate_outcomes <- c("RT","MT","HA")
+outcomes <- candidate_outcomes[candidate_outcomes %in% names(df)]
+if (length(outcomes) == 0) stop("No expected outcomes (RT/MT/HA) found in benchmark.csv")
+
+# Helper: coerce a column to numeric safely
+to_num <- function(x) suppressWarnings(as.numeric(x))
+
+# Ensure outcomes numeric
+for (y in outcomes) df[[y]] <- to_num(df[[y]])
+
+# Drop impossible values (NA ages/outcomes)
+df <- df %>% filter(!is.na(Age))
+
+# -----------------------------
+# 1) Cohen's d (youngest vs oldest tertiles), per Study
+#    + Hedges' g (small-sample correction)
+#    + Variance of g for meta-analysis
+# -----------------------------
+
+# --- PATCH: safely compute tertile effect sizes (uses dplyr::select explicitly) ---
+compute_tertile_g <- function(dfin, outcome) {
+  dfin %>%
+    dplyr::filter(!is.na(.data[[outcome]])) %>%
+    dplyr::group_by(Study) %>%
+    dplyr::mutate(age_tertile = dplyr::ntile(Age, 3)) %>%
+    dplyr::filter(age_tertile %in% c(1, 3)) %>%
+    dplyr::mutate(group = dplyr::if_else(age_tertile == 3, "old", "young")) %>%
+    dplyr::group_by(Study, group) %>%
+    dplyr::summarise(
+      n        = dplyr::n(),
+      m        = mean(.data[[outcome]], na.rm = TRUE),
+      sd       = stats::sd(.data[[outcome]], na.rm = TRUE),
+      mean_age = mean(Age, na.rm = TRUE),
+      .groups  = "drop"
+    ) %>%
+    tidyr::pivot_wider(
+      names_from  = group,
+      values_from = c(n, m, sd, mean_age),
+      names_sep   = "."
+    ) %>%
+    dplyr::mutate(
+      sp   = sqrt(((n.old - 1) * sd.old^2 + (n.young - 1) * sd.young^2) / (n.old + n.young - 2)),
+      d    = (m.old - m.young) / sp,
+      J    = 1 - 3 / (4 * (n.old + n.young) - 9),
+      g    = J * d,
+      var_g = ((n.old + n.young) / (n.old * n.young)) + (g^2 / (2 * (n.old + n.young - 2))),
+      se_g  = sqrt(var_g),
+      outcome = outcome
+    ) %>%
+    dplyr::select(Study, outcome, n.young, n.old, mean_age.young, mean_age.old, d, g, se_g, var_g)
+}
+
+
+es_list <- lapply(outcomes, function(y) compute_tertile_g(df, y))
+es_all  <- bind_rows(es_list)
+
+# Save per-study effect sizes table
+readr::write_csv(es_all, file.path(outdir, "per_study_hedges_g.csv"))
+
+# -----------------------------
+# 2) Random-effects meta-analysis (by outcome)
+#    - Using metafor::rma with yi = g, vi = var_g
+#    - Report pooled g, 95% CI, tau^2, I^2
+#    - Forest plot
+# -----------------------------
+
+meta_summaries <- lapply(outcomes, function(y) {
+  dat <- es_all %>% filter(outcome == y)
+  if (nrow(dat) < 2) {
+    warning(paste("Outcome", y, "has fewer than 2 studies with valid effect sizes. Skipping meta-analysis."))
+    return(NULL)
+  }
+
+  fit <- metafor::rma(yi = g, vi = var_g, data = dat, method = "REML")
+
+  # Forest plot
+  png(file.path(outdir, paste0("forest_", y, ".png")), width = 1200, height = 900, res = 150)
+  metafor::forest(fit,
+                  slab = paste0(dat$Study, " (nY=", dat$n.young, ", nO=", dat$n.old, ")"),
+                  xlab = paste0("Hedges' g (", y, "): Oldest vs Youngest tertiles"),
+                  cex = 0.9)
+  abline(v = 0, lty = 2)
+  dev.off()
+
+  tibble(
+    Outcome = y,
+    k       = fit$k,
+    g_hat   = as.numeric(fit$b),
+    ci_lb   = as.numeric(fit$ci.lb),
+    ci_ub   = as.numeric(fit$ci.ub),
+    tau2    = fit$tau2,
+    I2      = fit$I2
+  )
+})
+
+meta_tbl <- bind_rows(meta_summaries)
+readr::write_csv(meta_tbl, file.path(outdir, "meta_random_effects_summary.csv"))
+
+# -----------------------------
+# 3) Continuous-age effects (per Study) for transparency
+#    - Slope beta_age (ms/year)
+#    - Standardized slope (SD-age to SD-outcome)
+#    - Pearson r
+#    - Crosswalk d_from_slope across tertile age gap (for comparability)
+# -----------------------------
+
+per_study_slopes <- lapply(outcomes, function(y) {
+  df %>%
+    filter(!is.na(.data[[y]])) %>%
+    group_by(Study) %>%
+    group_modify(~{
+      dat <- .x
+      # simple linear regression Y ~ Age (per study)
+      fit <- lm(dat[[y]] ~ dat$Age)
+      tid <- broom::tidy(fit)
+      gl  <- broom::glance(fit)
+
+      beta_age <- tid$estimate[tid$term == "dat$Age"]
+      sd_age   <- sd(dat$Age, na.rm = TRUE)
+      sd_y     <- sd(dat[[y]], na.rm = TRUE)
+      beta_std <- beta_age * sd_age / sd_y
+      r        <- sqrt(gl$r.squared) * sign(beta_age)
+
+      # tertile age gap for crosswalk
+      tt <- dat %>% mutate(age_tertile = ntile(Age, 3)) %>%
+        group_by(age_tertile) %>%
+        summarise(n = n(), mean_age = mean(Age), .groups = "drop")
+      if (all(c(1,3) %in% tt$age_tertile)) {
+        Ayoung <- tt$mean_age[tt$age_tertile == 1]
+        Aold   <- tt$mean_age[tt$age_tertile == 3]
+        d_from_slope <- (beta_age * (Aold - Ayoung)) / sd_y
+      } else {
+        d_from_slope <- NA_real_
+      }
+
+      tibble(
+        Study = unique(dat$Study),
+        Outcome = y,
+        beta_age = beta_age,        # ms/year (or deg/year)
+        beta_std = beta_std,        # standardized slope
+        r = r,
+        d_from_r = if (is.na(r)) NA_real_ else 2*r/sqrt(1 - r^2),
+        d_from_slope = d_from_slope
+      )
+    }) %>% ungroup()
+}) %>% bind_rows()
+
+readr::write_csv(per_study_slopes, file.path(outdir, "per_study_continuous_age_slopes.csv"))
+
+# -----------------------------
+# 4) Compact console summary
+# -----------------------------
+message("\n==== Meta-analysis summary (random-effects, Hedges' g) ====\n")
+print(meta_tbl)
+
+message("\nSaved tables and plots in: ", normalizePath(outdir))
+message(" - per_study_hedges_g.csv")
+message(" - meta_random_effects_summary.csv")
+message(" - per_study_continuous_age_slopes.csv")
+message(" - forest_<Outcome>.png (per outcome)\n")
+
+# -----------------------------
+# 5) Optional: also run 'meta' package for a check (pooled SMD)
+# -----------------------------
+# This section serves as a cross-check using the 'meta' package's metagen/metacont API.
+# Comment/uncomment as needed.
+
+run_meta_pkg_check <- TRUE
+if (run_meta_pkg_check) {
+  meta_checks <- lapply(outcomes, function(y) {
+    dat <- es_all %>% filter(outcome == y)
+    if (nrow(dat) < 2) return(NULL)
+    # metagen expects yi (effect) and sei
+    mfit <- meta::metagen(TE = dat$g, seTE = dat$se_g,
+                          studlab = dat$Study,
+                          sm = "SMD", comb.fixed = FALSE, comb.random = TRUE,
+                          hakn = TRUE, method.tau = "REML")
+    # Save a forest too
+    png(file.path(outdir, paste0("forest_meta_pkg_", y, ".png")), width = 1200, height = 900, res = 150)
+    forest(mfit, xlab = paste0("Hedges' g (", y, ")"), leftcols = c("studlab"),
+           rightcols = c("effect", "ci"), print.I2 = TRUE)
+    dev.off()
+
+    tibble(
+      Outcome = y,
+      k = mfit$k,
+      g_hat = mfit$TE.random,
+      ci_lb = mfit$lower.random,
+      ci_ub = mfit$upper.random,
+      I2    = mfit$I2
+    )
+  })
+  meta_pkg_tbl <- bind_rows(meta_checks)
+  readr::write_csv(meta_pkg_tbl, file.path(outdir, "meta_meta_package_summary.csv"))
+}
+
+```
+
+```{r}
+library(pwr)
+library(readr)
+library(purrr)
+
+power_outdir <- file.path(outdir, "power_analytical")
+if (!dir.exists(power_outdir)) dir.create(power_outdir)
+
+solve_mde_d <- function(n1, n2, target_power = 0.80, alpha = 0.05) {
+  f <- function(d) pwr::pwr.t2n.test(n1 = n1, n2 = n2, d = d, sig.level = alpha, alternative = "two.sided")$power - target_power
+  if (is.na(n1) || is.na(n2) || n1 < 4 || n2 < 4) return(NA_real_)
+  lower <- 1e-4; upper <- 2
+  out <- try(uniroot(f, lower = lower, upper = upper)$root, silent = TRUE)
+  if (inherits(out, "try-error")) {
+    if (f(lower) >= 0) return(0)
+    return(NA_real_)
+  }
+  out
+}
+
+solve_mde_r <- function(n, target_power = 0.80, alpha = 0.05) {
+  g <- function(r) pwr::pwr.r.test(n = n, r = r, sig.level = alpha, alternative = "two.sided")$power - target_power
+  if (is.na(n) || n < 8) return(NA_real_)
+  lower <- 1e-4; upper <- 0.99
+  out <- try(uniroot(g, lower = lower, upper = upper)$root, silent = TRUE)
+  if (inherits(out, "try-error")) {
+    if (g(lower) >= 0) return(0)
+    return(NA_real_)
+  }
+  out
+}
+
+r_to_d <- function(r) ifelse(is.na(r), NA_real_, 2*r / sqrt(1 - r^2))
+
+power_per_study_d <- es_all %>%
+  mutate(
+    d_used = abs(g),  
+    power  = map2_dbl(n.young, n.old, ~ pwr::pwr.t2n.test(n1 = .x, n2 = .y, d = d_used[1], sig.level = 0.05)$power)
+  ) %>%
+  rowwise() %>%
+  mutate(
+    mde80_d = solve_mde_d(n.young, n.old, 0.80, 0.05),
+    mde90_d = solve_mde_d(n.young, n.old, 0.90, 0.05)
+  ) %>%
+  ungroup()
+
+write_csv(power_per_study_d, file.path(power_outdir, "power_per_study_tertile_d.csv"))
+
+power_combined_d <- es_all %>%
+  group_by(outcome) %>%
+  summarise(
+    n1_total = sum(n.young, na.rm = TRUE),
+    n2_total = sum(n.old,   na.rm = TRUE),
+    g_hat = meta_tbl$g_hat[match(first(outcome), meta_tbl$Outcome)]
+  ) %>%
+  mutate(
+    d_used = abs(g_hat),
+    power  = pmap_dbl(list(n1_total, n2_total, d_used), ~ pwr::pwr.t2n.test(n1 = ..1, n2 = ..2, d = ..3, sig.level = 0.05)$power),
+    mde80_d = map2_dbl(n1_total, n2_total, ~ solve_mde_d(.x, .y, 0.80, 0.05)),
+    mde90_d = map2_dbl(n1_total, n2_total, ~ solve_mde_d(.x, .y, 0.90, 0.05))
+  )
+
+write_csv(power_combined_d, file.path(power_outdir, "power_combined_tertile_d.csv"))
+
+Ns_by_study <- bind_rows(lapply(intersect(colnames(df), outcomes), function(y) {
+  df %>%
+    filter(!is.na(.data[[y]]), !is.na(Age)) %>%
+    group_by(Study) %>%
+    summarise(N = n(), .groups = "drop") %>%
+    mutate(Outcome = y)
+}))
+
+power_per_study_r <- per_study_slopes %>%
+  left_join(Ns_by_study, by = c("Study","Outcome")) %>%
+  mutate(
+    r_abs  = abs(r),
+    power  = map2_dbl(N, r_abs, ~ ifelse(is.na(.x) || is.na(.y), NA_real_,
+                                         pwr::pwr.r.test(n = .x, r = .y, sig.level = 0.05, alternative = "two.sided")$power)),
+    mde80_r = map_dbl(N, ~ solve_mde_r(.x, 0.80, 0.05)),
+    mde90_r = map_dbl(N, ~ solve_mde_r(.x, 0.90, 0.05)),
+    mde80_d_from_r = r_to_d(mde80_r),
+    mde90_d_from_r = r_to_d(mde90_r)
+  )
+
+write_csv(power_per_study_r, file.path(power_outdir, "power_per_study_continuous_r.csv"))
+```
+
+# Helper Functions
+## Forest Plot
+```{r}
+create_forest_plot <- function(data, measure, lower, upper, measure_label) {
+  data$Study <- factor(data$Study, 
+                      levels = rev(c("Study 1", "Study 2", "Study 3", "Study 4", "Overall")))
+  
+  p <- ggplot(data, aes_string(x = measure, y = "Study")) +
+    geom_vline(xintercept = 0, linetype = 'dotted') +
+    labs(x = measure_label, y = "") +
+    theme_minimal() +
+    theme(panel.border = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line.x = element_line(),
+          axis.line.y = element_blank(),
+          axis.text.y = element_text(size = 16, color = "black"),
+          axis.title.x = element_text(size = 16),
+          axis.text.x = element_text(size = 14),
+          legend.position = "none")
+  
+  overall_data <- data[data$Study == "Overall", ]
+  study_data <- data[data$Study != "Overall", ]
+  
+  p <- p +
+    geom_point(data = overall_data, color = "black") +
+    geom_errorbarh(data = overall_data, 
+                  aes_string(xmin = lower, xmax = upper), 
+                  height = 0.2, color = "black") +
+      geom_point(data = study_data, aes(color = Study)) +
+    geom_errorbarh(data = study_data, 
+                  aes_string(xmin = lower, xmax = upper, color = "Study"), 
+                  height = 0.2)
+  return(p)
+}
+```
+
+## Stan
+```{r}
+stan_code <- 
+"
+data {
+  int<lower=0> N;           
+  int<lower=0> J;           
+  array[N] int<lower=1, upper=J> study;
+  vector[N] Res;           
+  vector[N] Age;           
+  vector[N] Sex;           
+  vector<lower=0>[N] n_trials; 
+}
+parameters {
+  real alpha;              
+  real beta_Age;            
+  real beta_Sex;          
+  real<lower=0> sigma;      
+  vector[J] u_alpha;     
+  vector[J] u_beta_Age;
+  vector[J] u_beta_Sex;     
+
+  real<lower=0> sigma_alpha;  
+  real<lower=0> sigma_beta_Age;  
+  real<lower=0> sigma_beta_Sex;  
+}
+model {
+  alpha ~ normal(500, 500);  
+  beta_Age ~ normal(0, 20);
+  beta_Sex ~ normal(0, 100);
+  sigma ~ cauchy(0, 100);
+  u_alpha ~ normal(0, sigma_alpha);
+  u_beta_Age ~ normal(0, sigma_beta_Age);
+  u_beta_Sex ~ normal(0, sigma_beta_Sex);
+  
+  sigma_alpha ~ cauchy(0, 500);   
+  sigma_beta_Age ~ cauchy(0, 2.5);
+  sigma_beta_Sex ~ cauchy(0, 20);
+  
+  for (n in 1:N) {
+    real mu = alpha + u_alpha[study[n]] +
+              (beta_Age + u_beta_Age[study[n]]) * Age[n] +
+              (beta_Sex + u_beta_Sex[study[n]]) * Sex[n];
+    
+    real sigma_adj = sigma / sqrt(n_trials[n]);
+    
+    Res[n] ~ normal(mu, sigma_adj);
+  }
+}
+generated quantities {
+  vector[N] log_lik;
+  vector[N] y_rep;
+  
+  for (n in 1:N) {
+    real mu = alpha + u_alpha[study[n]] +
+              (beta_Age + u_beta_Age[study[n]]) * Age[n] +
+              (beta_Sex + u_beta_Sex[study[n]]) * Sex[n];
+    real sigma_adj = sigma / sqrt(n_trials[n]);
+    
+    log_lik[n] = normal_lpdf(Res[n] | mu, sigma_adj);
+    y_rep[n] = normal_rng(mu, sigma_adj);
+  }
+}
+"
+```
+
+
+## Stan Interact
+```{r}
+stan_inter <- "
+data {
+  int<lower=0> N;          
+  int<lower=0> J;         
+  array[N] int<lower=1, upper=J> study;
+  vector[N] Res;           
+  vector[N] Age;           
+  vector[N] Sex;            
+  vector<lower=0>[N] n_trials;  
+}
+
+parameters {
+  real alpha;               
+  real beta_Age;           
+  real beta_Sex;           
+  real beta_AgeSex;        
+  real<lower=0> sigma;      
+  vector[J] u_alpha;        
+  vector[J] u_beta_Age;    
+  vector[J] u_beta_Sex;     
+  vector[J] u_beta_AgeSex;  
+  real<lower=0> sigma_alpha;  
+  real<lower=0> sigma_beta_Age;  
+  real<lower=0> sigma_beta_Sex;  
+  real<lower=0> sigma_beta_AgeSex;  
+}
+
+model {
+  alpha ~ normal(500, 500);  
+  beta_Age ~ normal(0, 20);
+  beta_Sex ~ normal(0, 100);
+  sigma ~ cauchy(0, 100);
+  beta_AgeSex ~ normal(0, 10);
+  
+  
+  u_alpha ~ normal(0, sigma_alpha);
+  u_beta_Age ~ normal(0, sigma_beta_Age);
+  u_beta_Sex ~ normal(0, sigma_beta_Sex);
+  u_beta_AgeSex ~ normal(0, sigma_beta_AgeSex);
+  
+  sigma_alpha ~ cauchy(0, 500);   
+  sigma_beta_Age ~ cauchy(0, 2.5);
+  sigma_beta_Sex ~ cauchy(0, 20);
+  sigma_beta_AgeSex ~ cauchy(0, 2.5);
+
+  for (n in 1:N) {
+    real mu = alpha + u_alpha[study[n]] +
+              (beta_Age + u_beta_Age[study[n]]) * Age[n] +
+              (beta_Sex + u_beta_Sex[study[n]]) * Sex[n] +
+              (beta_AgeSex + u_beta_AgeSex[study[n]]) * Age[n] * Sex[n];
+    
+    real sigma_adj = sigma / sqrt(n_trials[n]);
+    
+    Res[n] ~ normal(mu, sigma_adj);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;  
+  vector[N] y_rep;   
+  
+  real beta_AgeSex_prior = normal_rng(0, 10);  
+  
+  for (n in 1:N) {
+    real mu = alpha + u_alpha[study[n]] +
+              (beta_Age + u_beta_Age[study[n]]) * Age[n] +
+              (beta_Sex + u_beta_Sex[study[n]]) * Sex[n] +
+              (beta_AgeSex + u_beta_AgeSex[study[n]]) * Age[n] * Sex[n];
+    
+    real sigma_adj = sigma / sqrt(n_trials[n]);
+    
+    log_lik[n] = normal_lpdf(Res[n] | mu, sigma_adj);
+    
+    y_rep[n] = normal_rng(mu, sigma_adj);
+  }
+}
+"
+
+```
+
+
+## Stan Poly
+```{r}
+stan_poly <- 
+"
+data {
+  int<lower=0> N;          
+  int<lower=0> J;          
+  array[N] int<lower=1, upper=J> study; 
+  vector[N] Res;             
+  vector[N] Age;            
+  vector[N] Sex;          
+  vector<lower=0>[N] n_trials;  
+}
+
+parameters {
+  real alpha;             
+  real beta_Age;           
+  real beta_Age2;          
+  real beta_Sex;           
+  real<lower=0> sigma;     
+  vector[J] u_alpha;      
+  vector[J] u_beta_Age;   
+  vector[J] u_beta_Age2;   
+  vector[J] u_beta_Sex;    
+  real<lower=0> sigma_alpha;  
+  real<lower=0> sigma_beta_Age;  
+  real<lower=0> sigma_beta_Age2;  
+  real<lower=0> sigma_beta_Sex;  
+}
+
+model {
+  // Priors
+  alpha ~ normal(0, 250);  
+  beta_Age ~ normal(0, 20);
+  beta_Age2 ~ normal(0, 5);
+  beta_Sex ~ normal(0, 50);
+  sigma ~ cauchy(0, 50);
+  
+  u_alpha ~ normal(0, sigma_alpha);
+  u_beta_Age ~ normal(0, sigma_beta_Age);
+  u_beta_Age2 ~ normal(0, sigma_beta_Age2);
+  u_beta_Sex ~ normal(0, sigma_beta_Sex);
+  
+  sigma_alpha ~ cauchy(0, 250);   
+  sigma_beta_Age ~ cauchy(0, 2.5);
+  sigma_beta_Sex ~ cauchy(0, 20);
+  sigma_beta_Age2 ~ cauchy(0, 2.5);
+
+  for (n in 1:N) {
+    real mu = alpha + u_alpha[study[n]] +
+              (beta_Age + u_beta_Age[study[n]]) * Age[n] +
+              (beta_Age2 + u_beta_Age2[study[n]]) * Age[n] * Age[n] +
+              (beta_Sex + u_beta_Sex[study[n]]) * Sex[n];
+    
+    real sigma_adj = sigma / sqrt(n_trials[n]);
+    
+    Res[n] ~ normal(mu, sigma_adj);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;  
+  vector[N] y_rep;    
+  
+  real beta_Age2_prior = normal_rng(0, 10);  
+  
+  for (n in 1:N) {
+    real mu = alpha + u_alpha[study[n]] +
+              (beta_Age + u_beta_Age[study[n]]) * Age[n] +
+              (beta_Age2 + u_beta_Age2[study[n]]) * Age[n] * Age[n] +
+              (beta_Sex + u_beta_Sex[study[n]]) * Sex[n];
+    
+    real sigma_adj = sigma / sqrt(n_trials[n]);
+    
+    log_lik[n] = normal_lpdf(Res[n] | mu, sigma_adj);
+    
+    y_rep[n] = normal_rng(mu, sigma_adj);
+  }
+}
+"
+```
+
+## BIC Calculation
+```{r}
+calculate_bic_stan <- function(fit_params, response, data_list, 
+                               inter = TRUE, poly = FALSE) {
+  n_iter <- length(fit_params$alpha)
+  N <- dim(data_list)[1]
+  
+  log_lik <- matrix(0, nrow = n_iter, ncol = N)
+  
+  if (inter){
+    for (i in 1:n_iter) {
+      alpha_total <- fit_params$alpha[i] + fit_params$u_alpha[i, data_list$Study]
+      beta_Age_total <- fit_params$beta_Age[i] + fit_params$u_beta_Age[i, data_list$Study]
+      beta_Sex_total <- fit_params$beta_Sex[i] + fit_params$u_beta_Sex[i, data_list$Study]
+      beta_AgeSex_total <- fit_params$beta_AgeSex[i] + fit_params$u_beta_AgeSex[i, data_list$Study]
+      
+      means <- alpha_total + 
+               beta_Age_total * data_list$Age +
+               beta_Sex_total * data_list$Sex +
+               beta_AgeSex_total * data_list$Age * data_list$Sex
+      
+      log_lik[i, ] <- dnorm(response, means, fit_params$sigma[i], log = TRUE)
+    }
+    n_params <- 8  
+  } else if (poly){
+    for (i in 1:n_iter) {
+    alpha_total <- fit_params$alpha[i] + fit_params$u_alpha[i, data_list$Study]
+    beta_Age_total <- fit_params$beta_Age[i] + fit_params$u_beta_Age[i, data_list$Study]
+    beta_Sex_total <- fit_params$beta_Sex[i] + fit_params$u_beta_Sex[i, data_list$Study]
+    beta_Age2_total <- fit_params$beta_Age2[i] + fit_params$u_beta_Age2[i, data_list$Study]
+    
+    means <- alpha_total + 
+             beta_Age_total * data_list$Age +
+             beta_Sex_total * data_list$Sex +
+             beta_Age2_total * (data_list$Age^2)
+    
+    log_lik[i, ] <- dnorm(response, means, fit_params$sigma[i], log = TRUE)
+    }
+    n_params <- 8 
+    
+  } else {
+    for (i in 1:n_iter) {
+    alpha_total <- fit_params$alpha[i] + fit_params$u_alpha[i, data_list$Study]
+    beta_Age_total <- fit_params$beta_Age[i] + fit_params$u_beta_Age[i, data_list$Study]
+    beta_Sex_total <- fit_params$beta_Sex[i] + fit_params$u_beta_Sex[i, data_list$Study]
+
+    means <- alpha_total + 
+             beta_Age_total * data_list$Age +
+             beta_Sex_total * data_list$Sex
+
+    log_lik[i, ] <- dnorm(response, means, fit_params$sigma[i], log = TRUE)
+    }
+    n_params <- 6  
+  }
+  
+  total_log_lik <- rowSums(log_lik)
+  mean_log_lik <- mean(total_log_lik)
+  bic_value <- -2 * mean_log_lik + log(N) * n_params
+  return(list(
+    log_lik = log_lik,
+    total_log_lik = total_log_lik,
+    mean_log_lik = mean_log_lik,
+    bic = bic_value
+  ))
+}
+
+```
+
+
+## Fit Stan
+
+```{r}
+fit_stan <- function(stan_model, df, res, inter = FALSE, poly = FALSE, 
+                     n_iter = 8000, n_chain = 4, hand = FALSE,
+                     trial_level = FALSE, study2 = FALSE, study2_no = FALSE){
+  df$Sex = as.numeric(df$Sex)
+  
+  if (trial_level){
+    data_list <- list(
+      N = nrow(df),
+      I = max(df$subject_id_stan),
+      J = max(df$study_id_stan),
+      subject = df$subject_id_stan,
+      study = df$study_id_stan,
+      Res = res, 
+      Age = df$Age,
+      Sex = ifelse(df$Sex == "F" | df$Sex == "Female", 0, 1),  # 0=F, 1=M
+      use_gamma = 0
+)
+  } else if (study2){
+    data_list <- list(
+  N = nrow(df),
+  Res = res,
+  Age = df$Age,
+  Handedness = (df$Handedness),
+  Sex = (df$Sex),
+  mousetype = (df$mousetype),
+  vision = (df$vision),
+  videogames = (df$videogames),
+  Sleep = df$Sleep,
+  ComputerUsage = df$ComputerUsage
+)
+  } else if (study2_no){
+     data_list <- list(
+    N = nrow(df),
+    Res = res,
+    Age = df$Age,
+    Sex = df$Sex
+  )
+  }
+  else {
+  data_list <- list(
+    N = nrow(df),
+    J = length(unique(df$Study)),
+    study = as.numeric(df$Study),
+    Res = res,
+    Age = df$Age,
+    Sex = df$Sex,
+    n_trials = df$NTrials
+  )
+  }
+  
+  
+  if (hand){
+    data_list$Handedness <- df$Handedness
+  }
+  if (poly){
+    data_list$Age_squared <- df$Age^2
+  }
+  if (inter){
+    data_list$Age_Sex <- df$Age * df$Sex
+  }
+  
+  model_file <- tempfile(fileext = ".stan")
+  writeLines(stan_model, model_file)
+  
+  mod <- cmdstan_model(model_file)
+  
+  if (trial_level){
+    fit <- mod$sample(
+      data = data_list,
+      chains = n_chain,
+      iter = n_iter,
+      iter_warmup = n_iter / 2,
+      iter_sampling = n_iter / 2,
+      parallel_chains = n_chain/2,
+      adapt_delta = 0.95,
+      init = function() {
+        list(
+          L_Omega_subj = diag(3),  # Start with identity matrix
+          tau_subj_intercept = 1,
+          tau_subj_age = 0.1,
+          tau_subj_sex = 0.1,
+          sigma = 1,
+          shape = 10
+        )
+      },
+      refresh = 500,
+      save_cmdstan_config=TRUE
+    )
+  } else {
+    fit <- mod$sample(
+      data = data_list,
+      iter_warmup = n_iter / 2,
+      iter_sampling = n_iter / 2,
+      chains = n_chain,
+      parallel_chains = n_chain/2,
+      # adapt_delta = 0.95,
+      # max_treedepth = 15,
+      refresh = 500,
+      save_cmdstan_config=TRUE
+    )
+  }
+  
+  
+  draws <- fit$draws(format = "draws_matrix")
+  param_names <- dimnames(draws)[[2]]
+  
+  params <- list()
+
+  base_names <- unique(gsub("\\[.*\\]", "", param_names))
+  base_names <- base_names[!grepl("__", base_names)] 
+  
+  for (base_name in base_names) {
+    array_indices <- grep(paste0("^", base_name, "\\["), param_names)
+    
+    if (length(array_indices) > 0) {
+      n_samples <- nrow(draws)
+      
+      index_patterns <- param_names[array_indices]
+      
+      if (all(grepl("^[^\\[]+\\[\\d+\\]$", index_patterns))) {
+        n_elements <- length(array_indices)
+        params[[base_name]] <- matrix(NA, nrow = n_samples, ncol = n_elements)
+        for (i in 1:n_elements) {
+          params[[base_name]][, i] <- as.vector(draws[, array_indices[i]])
+        }
+      } else {
+        params[[base_name]] <- lapply(array_indices, function(i) as.vector(draws[, i]))
+        names(params[[base_name]]) <- param_names[array_indices]
+      }
+    } else {
+      scalar_index <- which(param_names == base_name)
+      if (length(scalar_index) > 0) {
+        params[[base_name]] <- as.vector(draws[, scalar_index])
+      }
+    }
+  }
+  
+  diagnostics_summary <- fit$summary()
+  
+  log_lik_indices <- grep("^log_lik\\[", param_names)
+  if (length(log_lik_indices) > 0) {
+    log_lik_matrix <- matrix(NA, nrow = nrow(draws), ncol = length(log_lik_indices))
+    for (i in seq_along(log_lik_indices)) {
+      log_lik_matrix[, i] <- as.vector(draws[, log_lik_indices[i]])
+    }
+    loo_result <- loo(log_lik_matrix)
+  } else {
+    warning("log_lik not found in model output")
+    loo_result <- NULL
+  }
+  
+  cat("\n--- Model Diagnostics ---\n")
+  cat("Max R-hat:", round(max(diagnostics_summary$rhat, na.rm = TRUE), 3), "\n")
+  cat("Min n_eff:", round(min(diagnostics_summary$ess_bulk, na.rm = TRUE), 0), "\n")
+
+  if (!is.null(loo_result)) {
+    cat("LOO-IC:", round(loo_result$estimates["looic", "Estimate"], 2), "\n")
+    cat("p_loo:", round(loo_result$estimates["p_loo", "Estimate"], 2), "\n")
+  }
+  
+  sampler_diagnostics <- fit$diagnostic_summary()
+  cat("Divergences:", sum(sampler_diagnostics$num_divergent), "\n")
+  
+  if (max(diagnostics_summary$rhat, na.rm = TRUE) > 1.01) {
+    warning("R-hat > 1.01 detected. Model may not have converged.")
+  }
+  if (min(diagnostics_summary$ess_bulk, na.rm = TRUE) < 1000) {
+    warning("Low effective sample size detected (< 1000).")
+  }
+  
+
+  unlink(model_file)
+  
+  return(list(
+    params = params,
+    fit_cmdstan = fit,
+    loo = loo_result,
+    diagnostics = list(
+      max_rhat = max(diagnostics_summary$rhat, na.rm = TRUE),
+      min_neff = min(diagnostics_summary$ess_bulk, na.rm = TRUE),
+      num_divergent = sum(sampler_diagnostics$num_divergent)
+    )
+  ))
+}
+```
+
+
+## summary_overall_effects
+```{r}
+summary_overall_effects <- function(fit, df, levels = NULL, inter = FALSE, hand = FALSE) {
+  params <- fit$params
+  study_sizes <- table(df$Study)
+  weights <- as.numeric(study_sizes) / sum(as.numeric(study_sizes))
+  num_samples <- length(params$alpha)
+  num_studies <- length(unique(df$Study))
+  
+  diagnostics <- fit$diagnostics
+  
+  study_intercept <- matrix(NA, nrow = num_samples, ncol = num_studies)
+  study_age <- matrix(NA, nrow = num_samples, ncol = num_studies)
+  study_sex <- matrix(NA, nrow = num_samples, ncol = num_studies)
+  if (hand) {
+    study_hand <- matrix(NA, nrow = num_samples, ncol = num_studies)
+  } 
+  if (inter){
+    study_inter <- matrix(NA, nrow = num_samples, ncol = num_studies)
+  }
+  
+  for (i in 1:num_samples) {
+    for (j in 1:num_studies) {
+      study_intercept[i, j] <- params$alpha[i] + params$u_alpha[i, j]
+      study_age[i, j] <- params$beta_Age[i] + params$u_beta_Age[i, j]
+      study_sex[i, j] <- params$beta_Sex[i] + params$u_beta_Sex[i, j]
+      if (hand) {
+        study_hand[i, j] <- params$beta_Handedness[i] + params$u_beta_Handedness[i, j]
+      }
+      if (inter){
+        study_inter[i,j] <- params$beta_AgeSex[i] + params$u_beta_AgeSex[i,j]
+      }
+    }
+  }
+  
+  get_credible_interval <- function(x, prob = 0.95) {
+    probs <- c((1 - prob) / 2, 1 - (1 - prob) / 2)
+    return(quantile(x, probs = probs))
+  }
+  
+  if (hand) {
+    study_estimates_summary <- data.frame(
+      Study = levels(df$Study),
+      Intercept = apply(study_intercept, 2, mean),
+      Age = apply(study_age, 2, mean),
+      Sex = apply(study_sex, 2, mean),
+      Handedness = apply(study_hand, 2, mean),
+      Intercept_lower = apply(study_intercept, 2, function(x) get_credible_interval(x)[1]),
+      Intercept_upper = apply(study_intercept, 2, function(x) get_credible_interval(x)[2]),
+      Age_lower = apply(study_age, 2, function(x) get_credible_interval(x)[1]),
+      Age_upper = apply(study_age, 2, function(x) get_credible_interval(x)[2]),
+      Sex_lower = apply(study_sex, 2, function(x) get_credible_interval(x)[1]),
+      Sex_upper = apply(study_sex, 2, function(x) get_credible_interval(x)[2]),
+      Handedness_lower = apply(study_hand, 2, function(x) get_credible_interval(x)[1]),
+      Handedness_upper = apply(study_hand, 2, function(x) get_credible_interval(x)[2])
+    )
+    
+    weighted_intercept <- apply(study_intercept, 1, weighted.mean, w = weights)
+    weighted_age <- apply(study_age, 1, weighted.mean, w = weights)
+    weighted_sex <- apply(study_sex, 1, weighted.mean, w = weights)
+    weighted_handedness <- apply(study_hand, 1, weighted.mean, w = weights)
+    
+    overall_effects <- data.frame(
+      Study = "Overall",
+      Intercept = mean(weighted_intercept),
+      Age = mean(weighted_age),
+      Sex = mean(weighted_sex),
+      Handedness = mean(weighted_handedness),
+      Intercept_lower = get_credible_interval(weighted_intercept)[1],
+      Intercept_upper = get_credible_interval(weighted_intercept)[2],
+      Age_lower = get_credible_interval(weighted_age)[1],
+      Age_upper = get_credible_interval(weighted_age)[2],
+      Sex_lower = get_credible_interval(weighted_sex)[1],
+      Sex_upper = get_credible_interval(weighted_sex)[2],
+      Handedness_lower = get_credible_interval(weighted_handedness)[1],
+      Handedness_upper = get_credible_interval(weighted_handedness)[2]
+    )
+    
+  } else if (inter) {
+    study_estimates_summary <- data.frame(
+      Study = levels(df$Study),
+      Intercept = apply(study_intercept, 2, mean),
+      Age = apply(study_age, 2, mean),
+      Sex = apply(study_sex, 2, mean),
+      Inter = apply(study_inter, 2, mean),
+      Intercept_lower = apply(study_intercept, 2, function(x) get_credible_interval(x)[1]),
+      Intercept_upper = apply(study_intercept, 2, function(x) get_credible_interval(x)[2]),
+      Age_lower = apply(study_age, 2, function(x) get_credible_interval(x)[1]),
+      Age_upper = apply(study_age, 2, function(x) get_credible_interval(x)[2]),
+      Sex_lower = apply(study_sex, 2, function(x) get_credible_interval(x)[1]),
+      Sex_upper = apply(study_sex, 2, function(x) get_credible_interval(x)[2]),
+      Inter_lower = apply(study_inter, 2, function(x) get_credible_interval(x)[1]),
+      Inter_upper = apply(study_inter, 2, function(x) get_credible_interval(x)[2])
+    )
+    
+    weighted_intercept <- apply(study_intercept, 1, weighted.mean, w = weights)
+    weighted_age <- apply(study_age, 1, weighted.mean, w = weights)
+    weighted_sex <- apply(study_sex, 1, weighted.mean, w = weights)
+    weighted_inter <- apply(study_inter, 1, weighted.mean, w = weights)
+    
+    
+    overall_effects <- data.frame(
+      Study = "Overall",
+      Intercept = mean(weighted_intercept),
+      Age = mean(weighted_age),
+      Sex = mean(weighted_sex),
+      Inter = mean(weighted_inter),
+      Intercept_lower = get_credible_interval(weighted_intercept)[1],
+      Intercept_upper = get_credible_interval(weighted_intercept)[2],
+      Age_lower = get_credible_interval(weighted_age)[1],
+      Age_upper = get_credible_interval(weighted_age)[2],
+      Sex_lower = get_credible_interval(weighted_sex)[1],
+      Sex_upper = get_credible_interval(weighted_sex)[2],
+      Inter_lower = get_credible_interval(weighted_inter)[1],
+      Inter_upper = get_credible_interval(weighted_inter)[2]
+    )
+    
+  } else {
+    study_estimates_summary <- data.frame(
+      Study = levels(df$Study),
+      Intercept = apply(study_intercept, 2, mean),
+      Age = apply(study_age, 2, mean),
+      Sex = apply(study_sex, 2, mean),
+      Intercept_lower = apply(study_intercept, 2, function(x) get_credible_interval(x)[1]),
+      Intercept_upper = apply(study_intercept, 2, function(x) get_credible_interval(x)[2]),
+      Age_lower = apply(study_age, 2, function(x) get_credible_interval(x)[1]),
+      Age_upper = apply(study_age, 2, function(x) get_credible_interval(x)[2]),
+      Sex_lower = apply(study_sex, 2, function(x) get_credible_interval(x)[1]),
+      Sex_upper = apply(study_sex, 2, function(x) get_credible_interval(x)[2])
+    )
+    
+    weighted_intercept <- apply(study_intercept, 1, weighted.mean, w = weights)
+    weighted_age <- apply(study_age, 1, weighted.mean, w = weights)
+    weighted_sex <- apply(study_sex, 1, weighted.mean, w = weights)
+    
+    overall_effects <- data.frame(
+      Study = "Overall",
+      Intercept = mean(weighted_intercept),
+      Age = mean(weighted_age),
+      Sex = mean(weighted_sex),
+      Intercept_lower = get_credible_interval(weighted_intercept)[1],
+      Intercept_upper = get_credible_interval(weighted_intercept)[2],
+      Age_lower = get_credible_interval(weighted_age)[1],
+      Age_upper = get_credible_interval(weighted_age)[2],
+      Sex_lower = get_credible_interval(weighted_sex)[1],
+      Sex_upper = get_credible_interval(weighted_sex)[2]
+    )
+  }
+  
+  print(p_direction(weighted_sex))
+  
+  study_estimates_summary <- rbind(study_estimates_summary, overall_effects)
+  rownames(study_estimates_summary) <- 1:nrow(study_estimates_summary)
+  
+  sig_cols <- grep("(_lower|_upper)$", names(study_estimates_summary), value = TRUE)
+  param_names <- unique(gsub("(_lower|_upper)$", "", sig_cols))
+  
+  for (param in param_names) {
+    if (param != "Intercept") {  
+      lower_col <- paste0(param, "_lower")
+      upper_col <- paste0(param, "_upper")
+      sig_col <- paste0(param, "_sig")
+      
+      study_estimates_summary[[sig_col]] <- ifelse(
+        sign(study_estimates_summary[[lower_col]]) == sign(study_estimates_summary[[upper_col]]) & 
+        study_estimates_summary[[lower_col]] != 0,
+        "*", ""
+      )
+    }
+  }
+  
+  if (!is.null(levels)) {
+    study_estimates_summary$Study <- factor(study_estimates_summary$Study, levels = levels)
+  }
+  
+  attr(study_estimates_summary, "diagnostics") <- diagnostics
+  attr(study_estimates_summary, "credible_interval_type") <- "percentile-based (95%)"
+  
+  cat("\n=== Model Summary ===\n")
+  cat("Convergence: Max R-hat =", round(diagnostics$max_rhat, 3), 
+      "| Min n_eff =", round(diagnostics$min_neff, 0), "\n")
+  cat("Credible Intervals: 95% percentile-based\n")
+  cat("\nOverall Effects:\n")
+  print(overall_effects[, c("Age", "Age_lower", "Age_upper", "Sex", "Sex_lower", "Sex_upper")])
+  
+  return(study_estimates_summary)
+}
+```
+
+## plot_param
+```{r}
+plot_param <- function(beta_effect, u_effect, title){
+  plot_data <- data.frame(
+    Study = factor(rep(1:dim(u_effect)[2], each = length(beta_effect)),
+                   levels = dim(u_effect)[2]:1),
+    Effect = c(sapply(1:dim(u_effect)[2], function(j) u_effect[,j] + beta_effect))
+  )
+  
+  p2 <- plot_data %>%
+    ggplot(., aes(x = Effect, color = Study)) +
+    geom_density() +
+    labs(title = "",
+         x = title,
+         y = "Density") +
+    guides(color = guide_legend(reverse = TRUE)) +
+    theme_minimal()
+  
+  return(p2)
+}
+```
+
+## get_ci
+```{r}
+get_ci <- function(posterior_samples, param_names){
+  stan_param_names <- paste0("beta_", param_names)
+
+  summary_df <- data.frame(
+    Parameter = param_names,
+    Mean = numeric(length(stan_param_names)),
+    Lower_95 = numeric(length(stan_param_names)),
+    Upper_95 = numeric(length(stan_param_names)),
+    stringsAsFactors = FALSE
+    )
+  
+  for (i in 1:length(stan_param_names)) {
+    param <- stan_param_names[i]
+    samples <- posterior_samples[[param]]
+    
+    summary_df$Mean[i] <- mean(samples)
+    summary_df$Lower_95[i] <- quantile(samples, 0.025)
+    summary_df$Upper_95[i] <- quantile(samples, 0.975)
+  }
+  
+  return(summary_df)
+}
+```
+
+
+## plot_prior_posterior
+```{r}
+library(grid)
+library(gridExtra)
+
+plot_prior_posterior <- function(posterior_samples,
+                                 normal = TRUE, combined = FALSE,
+                                 filename,
+                                 parameter_name = "Parameter",
+                                 plot_title = NULL,
+                                 speed = TRUE) {
+
+  measure_title <- ifelse(speed, "ms", "\u00B0")
+
+ 
+  if (!combined){
+    
+    is_indexed_sigma <- exists("parameter_name") && 
+                        any(grepl("sigma", as.character(parameter_name))) && 
+                        any(grepl("\\[", as.character(parameter_name)))
+                        
+    if (is_indexed_sigma) {
+      upper_bound <- quantile(posterior_samples, 0.975)
+      filtered_samples <- posterior_samples[posterior_samples <= upper_bound]
+      posterior_df <- data.frame(value = filtered_samples)
+      range_post <- paste0(round(mean(posterior_samples), 1), " ", measure_title,
+                           " [",
+                           round(min(posterior_samples), 1), ", ",
+                           round(upper_bound, 1), "]", sep = "")
+    } else {
+      posterior_df <- data.frame(value = posterior_samples)
+      range_post <- paste0(round(mean(posterior_samples), 1), " ", measure_title,
+                           " [",
+                           round(quantile(posterior_samples, 0.025), 1), ", ",
+                           round(quantile(posterior_samples, 0.975), 1), "]", sep = "")
+    }
+    
+    posterior_plot <- ggplot(posterior_df, aes(x = value)) +
+      geom_density(aes(fill = range_post), alpha = 0.4, size = 0) +
+      geom_vline(xintercept = mean(posterior_samples),
+                 linetype = "dashed", color = "red", size = 0.5) +
+      scale_fill_manual(values = c("#2E8B57"), name = NULL) +
+      guides(fill = guide_legend(override.aes = list(fill = NA, color = NA))) +
+      labs(
+        x = parameter_name,
+        y = "Density"
+      ) + th +   
+      theme(legend.background = element_rect(fill = "transparent"),
+            legend.key = element_rect(fill = "transparent", color = NA),
+      )
+  
+  } else {
+    if (!is.data.frame(posterior_samples)) {
+        posterior_samples <- as.data.frame(posterior_samples)
+    }
+    names(posterior_samples) <- paste("Study", 1:ncol(posterior_samples))
+    
+    plot_data <- data.frame(
+      value = unlist(posterior_samples, use.names = FALSE),
+      study = factor(rep(study_names, each = n_samples), levels = study_names)
+    )
+    
+    legend_labels <- sapply(study_names, function(s_name) {
+      samples <- posterior_samples[[s_name]]
+      mean_val <- round(mean(samples), 1)
+      q025 <- round(quantile(samples, 0.025), 1)
+      q975 <- round(quantile(samples, 0.975), 1)
+      paste0(s_name, ": ", mean_val, " [", q025, ", ", q975, "]")
+    })
+    
+    study_means_df <- data.frame(
+        study = factor(study_names, levels = study_names),
+        mean_val = colMeans(posterior_samples)
+    )
+  
+    posterior_plot <- ggplot(plot_data, aes(x = value, fill = study)) +
+      geom_density(size = 0, alpha = 0.2) +
+      geom_vline(
+        data = study_means_df, 
+        aes(xintercept = mean_val, color = study), 
+        linetype = "dashed", 
+        size = 0.5, 
+        show.legend = FALSE
+      ) +
+      scale_fill_discrete(labels = legend_labels) +
+      scale_color_discrete() + 
+      labs(
+        x = parameter_name,
+        y = "Density",
+        fill = "Study"
+      ) + th + 
+      theme(
+        legend.position = c(0.0, 0.8),         
+        legend.justification = c(0, 0.5),     
+        legend.background = element_rect(fill = "transparent"), 
+        legend.key = element_rect(fill = "transparent", color = NA),
+        legend.text = element_text(size = 7),
+        legend.title = element_text(size = 7),
+        legend.spacing.y = unit(0.3, "cm") 
+      ) +
+  guides(
+    fill = guide_legend(keywidth = 0.4, keyheight = 0.4)  
+  )
+
+  }
+  
+  combined_plot <- posterior_plot
+  
+  save_path <- "~/Desktop/Research/kinematic data/metadata/"
+  dir.create(save_path, recursive = TRUE, showWarnings = FALSE)
+  
+  full_path <- file.path(save_path, paste0(filename, ".png"))
+
+  cat("Plot saved to:", full_path, "\n")
+  return(combined_plot)
+}
+```
+
+# All Study
+## RT
+```{r}
+fit_rt <- fit_stan(stan_code, combined_data, combined_data$RT, 
+                   inter = FALSE, poly = FALSE, hand = FALSE,
+                   n_iter = 8000)
+
+pareto_k <- fit_rt$loo$diagnostics$pareto_k
+problematic <- which(pareto_k > 0.7)
+n_bad <- sum(pareto_k > 0.5)
+n_very_bad <- sum(pareto_k > 0.7)
+n_extremely_bad <- sum(pareto_k > 1.0)
+
+cat("Pareto k diagnostics:\n")
+cat("  Moderate (k > 0.5):", n_bad, "observations\n")
+cat("  High (k > 0.7):", n_very_bad, "observations\n") 
+cat("  Very high (k > 1.0):", n_extremely_bad, "observations\n")
+
+fit_rt <- readRDS('fit_rt.rds')
+```
+
+
+```{r}
+summary_rt <- summary_overall_effects(fit_rt, combined_data, 
+                                      levels = c('Overall', "Study 4",
+                                                 "Study 3", "Study 2", "Study 1"),
+                                       inter = FALSE, hand = FALSE)
+print(summary_rt)
+
+summary_rt
+summary_rt <- summary_rt %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_rt
+
+```
+
+```{r}
+age_forest_rt <- create_forest_plot(summary_rt, "Age", "Age_lower", "Age_upper", "ms/year")
+age_forest_rt
+sex_forest_rt <- create_forest_plot(summary_rt, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_rt
+
+plot_prior_posterior(posterior_samples = fit_rt$params$beta_Sex, 
+                             normal = TRUE,
+                             filename = "rt_beta_sex_comparison",
+                             parameter_name = bquote(beta[Sex]^RT))
+
+```
+
+## MT
+```{r}
+fit_mt <- fit_stan(stan_code, combined_data, combined_data$MT, 
+                   inter = FALSE, poly = FALSE, hand = FALSE,
+                   n_iter = 8000)
+
+pareto_k <- fit_mt$loo$diagnostics$pareto_k
+problematic <- which(pareto_k > 0.7)
+n_bad <- sum(pareto_k > 0.5)
+n_very_bad <- sum(pareto_k > 0.7)
+n_extremely_bad <- sum(pareto_k > 1.0)
+
+cat("Pareto k diagnostics:\n")
+cat("  Moderate (k > 0.5):", n_bad, "observations\n")
+cat("  High (k > 0.7):", n_very_bad, "observations\n") 
+cat("  Very high (k > 1.0):", n_extremely_bad, "observations\n")
+
+saveRDS(fit_mt, 'fit_mt.rds')
+
+summary_mt <- summary_overall_effects(fit_mt, combined_data, 
+                                       levels = c('Overall', "Study 4", 
+                                                  "Study 3", "Study 2", "Study 1"),
+                                       hand = FALSE)
+write.csv(summary_mt, "study_estimates_summary_mt.csv")
+summary_mt <- read.csv("study_estimates_summary_mt.csv"
+                       )
+summary_mt <- summary_mt %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_mt
+
+age_forest_mt <- create_forest_plot(summary_mt, "Age", "Age_lower", "Age_upper", 
+                                    "ms/year")
+age_forest_mt
+sex_forest_mt <- create_forest_plot(summary_mt, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_mt
+```
+
+```{r}
+
+plot_prior_posterior(posterior_samples = fit_mt$params$beta_Sex, 
+                             normal = TRUE,
+                             filename = "mt_beta_sex_comparison",
+                             parameter_name = bquote(beta[Sex]^MT))
+
+```
+
+
+## HA
+```{r}
+fit_ha <- fit_stan(stan_code, combined_data, combined_data$HA, inter = FALSE, 
+                   poly = FALSE, hand = FALSE, n_iter = 8000)
+
+pareto_k <- fit_rt$loo$diagnostics$pareto_k
+problematic <- which(pareto_k > 0.7)
+n_bad <- sum(pareto_k > 0.5)
+n_very_bad <- sum(pareto_k > 0.7)
+n_extremely_bad <- sum(pareto_k > 1.0)
+
+cat("Pareto k diagnostics:\n")
+cat("  Moderate (k > 0.5):", n_bad, "observations\n")
+cat("  High (k > 0.7):", n_very_bad, "observations\n") 
+cat("  Very high (k > 1.0):", n_extremely_bad, "observations\n")
+
+saveRDS(fit_ha, 'fit_ha.rds')
+```
+
+
+```{r}
+fit_ha <- readRDS('fit_ha.rds')
+
+summary_ha <- summary_overall_effects(fit_ha, combined_data, 
+                                       levels = c('Overall', "Study 4", 
+                                                  "Study 3", "Study 2", "Study 1"),
+                                       hand = FALSE)
+write.csv(summary_ha, "study_estimates_summary_ha.csv")
+
+summary_ha <- read.csv("study_estimates_summary_ha.csv")
+
+summary_ha
+summary_ha <- summary_ha %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_ha
+
+age_forest_ha <- create_forest_plot(summary_ha, "Age", "Age_lower", "Age_upper", 
+                                    "\u00B0/year")
+age_forest_ha
+sex_forest_ha <- create_forest_plot(summary_ha, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 Degree (F-M)")
+sex_forest_ha
+```
+
+```{r}
+plot_param(fit_ha$params$beta_Age, fit_ha$params$u_beta_Age, 'Age per study')
+
+plot_param(-1*fit_ha$params$beta_Sex, -1*fit_ha$params$u_beta_Sex, 'Sex per study')
+```
+
+```{r}
+fit_ha <- readRDS('~/Desktop/Research/kinematic data/metadata/store_fit/fit_ha.rds')
+
+plot_prior_posterior(posterior_samples = fit_ha$params$beta_Sex, 
+                             normal = TRUE,
+                             filename = "ha_beta_sex_comparison",
+                             parameter_name = bquote(beta[Sex]^MP))
+```
+
+# All Study - Interact
+## RT
+```{r}
+fit_rt_inter <- fit_stan(stan_inter, combined_data, combined_data$RT, 
+                         inter = TRUE, poly = FALSE, hand = FALSE,
+                         n_iter = 8000)
+
+pareto_k <- fit_rt_inter$loo$diagnostics$pareto_k
+problematic <- which(pareto_k > 0.7)
+n_bad <- sum(pareto_k > 0.5)
+n_very_bad <- sum(pareto_k > 0.7)
+n_extremely_bad <- sum(pareto_k > 1.0)
+
+cat("Pareto k diagnostics:\n")
+cat("  Moderate (k > 0.5):", n_bad, "observations\n")
+cat("  High (k > 0.7):", n_very_bad, "observations\n") 
+cat("  Very high (k > 1.0):", n_extremely_bad, "observations\n")
+```
+
+```{r}
+summary_rt_inter <- summary_overall_effects(fit_rt_inter, combined_data, levels = c('Overall', "Study 4", 
+                                                                        "Study 3", "Study 2", "Study 1"),
+                                       hand = FALSE, inter = TRUE)
+summary_rt_inter
+write.csv(summary_rt_inter, "summary_rt_inter.csv")
+
+summary_rt_inter <- read.csv("summary_rt_inter.csv")
+summary_rt_inter
+summary_rt_inter <- summary_rt_inter %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_rt_inter
+
+
+age_forest_rt_inter <- create_forest_plot(summary_rt_inter, "Age", "Age_lower", "Age_upper", "ms/year")
+age_forest_rt_inter
+ggsave("age_forest_rt_inter.png", age_forest_rt_inter, width = 4, height = 4, units = "in")
+sex_forest_rt_inter <- create_forest_plot(summary_rt_inter, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_rt_inter
+ggsave("sex_forest_rt_inter.png", sex_forest_rt_inter, width = 4, height = 4, units = "in")
+
+age_sex_forest_rt_inter <- create_forest_plot(summary_rt_inter, "Inter", "Inter_lower", "Inter_upper", 
+                                    "\u0394 ms (F-M)")
+age_sex_forest_rt_inter
+```
+
+## MT
+```{r}
+fit_mt_inter <- fit_stan(stan_inter, combined_data, combined_data$MT, inter = TRUE, 
+                         poly = FALSE, hand = FALSE, n_iter = 8000, n_chain = 4)
+saveRDS(fit_mt_inter, 'fit_mt_inter.rds')
+
+pareto_k <- fit_mt_inter$loo$diagnostics$pareto_k
+problematic <- which(pareto_k > 0.7)
+n_bad <- sum(pareto_k > 0.5)
+n_very_bad <- sum(pareto_k > 0.7)
+n_extremely_bad <- sum(pareto_k > 1.0)
+
+cat("Pareto k diagnostics:\n")
+cat("  Moderate (k > 0.5):", n_bad, "observations\n")
+cat("  High (k > 0.7):", n_very_bad, "observations\n") 
+cat("  Very high (k > 1.0):", n_extremely_bad, "observations\n")
+```
+
+```{r}
+summary_mt_inter <- summary_overall_effects(fit_mt_inter, combined_data, 
+                                       levels = c('Overall', "Study 4", 
+                                                  "Study 3", "Study 2", "Study 1"),
+                                       hand = FALSE, inter = TRUE)
+write.csv(summary_mt_inter, "summary_mt_inter.csv")
+summary_mt_inter <- read.csv("summary_mt_inter.csv")
+summary_mt_inter <- summary_mt_inter %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_mt_inter
+
+age_forest_mt_inter <- create_forest_plot(summary_mt_inter, "Age", "Age_lower", "Age_upper", 
+                                    "ms/year")
+age_forest_mt_inter
+ggsave("age_forest_mt_inter.png", age_forest_mt_inter, width = 4, height = 4, units = "in")
+sex_forest_mt_inter <- create_forest_plot(summary_mt_inter, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_mt_inter
+
+age_sex_forest_mt_inter <- create_forest_plot(summary_mt_inter, "Inter", "Inter_lower", "Inter_upper",
+                                              "\u0394 ms (F-M)")
+age_sex_forest_mt_inter
+```
+
+## HA
+```{r}
+fit_ha_inter <- fit_stan(stan_inter, combined_data, combined_data$HA, poly = FALSE, hand = FALSE, inter = TRUE, n_iter = 8000)
+
+pareto_k <- fit_ha_inter$loo$diagnostics$pareto_k
+problematic <- which(pareto_k > 0.7)
+n_bad <- sum(pareto_k > 0.5)
+n_very_bad <- sum(pareto_k > 0.7)
+n_extremely_bad <- sum(pareto_k > 1.0)
+
+cat("Pareto k diagnostics:\n")
+cat("  Moderate (k > 0.5):", n_bad, "observations\n")
+cat("  High (k > 0.7):", n_very_bad, "observations\n") 
+cat("  Very high (k > 1.0):", n_extremely_bad, "observations\n")
+```
+
+
+```{r}
+summary_ha_inter <- summary_overall_effects(fit_ha_inter, combined_data, 
+                                       levels = c('Overall', "Study 4", 
+                                                  "Study 3", "Study 2", "Study 1"),
+                                       hand = FALSE, inter = TRUE)
+write.csv(summary_ha_inter, "summary_ha_inter.csv")
+
+summary_ha_inter <- read.csv("summary_ha_inter.csv")
+
+summary_ha_inter
+summary_ha_inter <- summary_ha_inter %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_ha_inter
+
+age_forest_ha_inter <- create_forest_plot(summary_ha_inter, "Age", "Age_lower", "Age_upper", 
+                                    "\u00B0/year")
+age_forest_ha_inter
+sex_forest_ha_inter <- create_forest_plot(summary_ha_inter, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 Degree (F-M)")
+sex_forest_ha_inter
+
+age_sex_forest_ha_inter <- create_forest_plot(summary_ha_inter, "Inter", "Inter_lower", "Inter_upper", 
+                                    "\u0394 Degree (F-M)")
+age_sex_forest_ha_inter
+```
+
+# Polynomial
+## RT 
+```{r}
+rt_poly = fit_stan(stan_poly, combined_data, combined_data$RT, hand = FALSE,
+                   poly = TRUE, n_iter = 8000)
+
+```
+
+## MT
+```{r}
+mt_poly = fit_stan(stan_poly, combined_data, combined_data$MT, 
+                   hand = FALSE,
+                   poly = TRUE, n_iter = 8000)
+
+```
+
+## HA 
+```{r}
+ha_poly = fit_stan(stan_poly, combined_data, combined_data$HA, hand = FALSE,
+                   poly = TRUE, n_iter = 8000)
+```
+
+
+# Study 2
+```{r}
+study2 <- 
+  read_csv("sensor_processed_data.csv")[,c('Sex', 'Age', 'Handedness',
+                                           'RT', 'MT', 'HA', 'mousetype', 'vision',
+                                    'videogames', 'Sleep', 'ComputerUsage')]
+
+demo <- study2 %>% select(-HA, -MT, -RT)
+
+```
+
+```{r}
+stan_study2 <- "
+data {
+  int<lower=0> N;                 // number of observations
+  vector[N] Res;                   // response variable (Movement Time)
+  vector[N] Age;                  // predictor
+  vector[N] Handedness;           // predictor
+  vector[N] Sex;                  // predictor
+  vector[N] mousetype;            // predictor
+  vector[N] vision;               // predictor
+  vector[N] videogames;           // predictor
+  vector[N] Sleep;                // predictor
+  vector[N] ComputerUsage;        // predictor
+}
+
+parameters {
+  real alpha;                     // intercept
+  real beta_Age;                  // coefficient for Age
+  real beta_Handedness;           // coefficient for Handedness
+  real beta_Sex;                  // coefficient for Sex
+  real beta_mousetype;            // coefficient for mousetype
+  real beta_vision;               // coefficient for clumsy
+  real beta_videogames;           // coefficient for videogames
+  real beta_Sleep;                // coefficient for Sleep
+  real beta_ComputerUsage;        // coefficient for ComputerUsage
+  real<lower=0> sigma;            // residual SD
+}
+
+model {
+  // Priors
+  alpha ~ normal(0, 100);
+  beta_Age ~ normal(0, 20);
+  beta_Handedness ~ normal(0, 50);
+  beta_Sex ~ normal(0, 50);
+  beta_mousetype ~ normal(0, 50);
+  beta_vision ~ normal(0, 50);
+  beta_videogames ~ normal(0, 50);
+  beta_Sleep ~ normal(0, 50);
+  beta_ComputerUsage ~ normal(0, 50);
+  sigma ~ cauchy(0, 25);
+  
+  // Likelihood
+  Res ~ normal(alpha + 
+              beta_Age * Age +
+              beta_Handedness * Handedness +
+              beta_Sex * Sex +
+              beta_mousetype * mousetype +
+              beta_vision * vision +
+              beta_videogames * videogames +
+              beta_Sleep * Sleep +
+              beta_ComputerUsage * ComputerUsage,
+              sigma);
+}
+
+generated quantities {
+  vector[N] y_rep;
+  vector[N] log_lik;
+  
+  for (n in 1:N) {
+    real mu = alpha + 
+              beta_Age * Age[n] +
+              beta_Handedness * Handedness[n] +
+              beta_Sex * Sex[n] +
+              beta_mousetype * mousetype[n] +
+              beta_vision * vision[n] +
+              beta_videogames * videogames[n] +
+              beta_Sleep * Sleep[n] +
+              beta_ComputerUsage * ComputerUsage[n];
+    
+    y_rep[n] = normal_rng(mu, sigma);
+    log_lik[n] = normal_lpdf(Res[n] | mu, sigma);
+  }
+}
+"
+```
+
+```{r}
+stan_study2_no <- "
+data {
+  int<lower=0> N;
+  vector[N] Res; 
+  vector[N] Age; 
+  vector[N] Sex; 
+}
+
+parameters {
+  real alpha;
+  real beta_Age;
+  real beta_Sex;
+  real<lower=0> sigma;
+}
+
+model {
+  // Priors
+   alpha ~ normal(0, 100);
+  beta_Age ~ normal(0, 20);
+  beta_Sex ~ normal(0, 50);
+  sigma ~ cauchy(0, 25);
+  
+  // Likelihood
+  Res ~ normal(alpha + 
+              beta_Age * Age +
+              beta_Sex * Sex,
+              sigma);
+}
+
+generated quantities {
+  vector[N] y_rep;
+  vector[N] log_lik;
+  
+  for (n in 1:N) {
+    real mu = alpha + 
+              beta_Age * Age[n] +
+              beta_Sex * Sex[n];
+
+    y_rep[n] = normal_rng(mu, sigma);
+    log_lik[n] = normal_lpdf(Res[n] | mu, sigma);
+  }
+}
+"
+```
+
+```{r}
+param_names_study2 <- c(
+  "Age", 
+  "Handedness", 
+  "Sex", 
+  "mousetype", 
+  "videogames",
+  "Sleep", 
+  "ComputerUsage",
+  "vision"
+)
+```
+
+## RT
+
+
+```{r}
+
+fit_rt_study2 <- fit_stan(stan_study2, study2, study2$RT, 
+                   inter = FALSE, poly = FALSE, hand = FALSE, study2 = TRUE,
+                   n_iter = 8000)
+
+params_rt_study2 <- fit_rt_study2$params
+rt_study2_summary <- get_ci(params_rt_study2, param_names_study2) %>%
+  mutate(Parameter = factor(Parameter, 
+                           levels = c("Sleep", "ComputerUsage", "vision", "videogames",
+                                      "mousetype", "Handedness", "Sex", "Age"))) %>%
+  arrange(Parameter)
+write.csv(rt_study2_summary, "rt_study2_summary.csv")
+read.csv("rt_study2_summary.csv")
+```
+
+```{r}
+rt_study2_summary <- read.csv("rt_study2_summary.csv")
+
+rt_study2_summary <- rt_study2_summary %>%
+  mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+
+print(rt_study2_summary)
+
+
+s2_rt <- read.csv("rt_study2_summary.csv") %>% mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+s2_rt$Parameter[s2_rt$Parameter == "vision"] <- "Vision (C-U)"
+s2_rt$Parameter[s2_rt$Parameter == "ComputerUsage"] <- "Comp"
+s2_rt$Parameter[s2_rt$Parameter == "Handedness"] <- "Hand (R-L)"
+s2_rt$Parameter[s2_rt$Parameter == "Sex"] <- "Sex (F-M)"
+s2_rt$Parameter[s2_rt$Parameter == "videogames"] <- "Game (1~5)"
+s2_rt$Parameter[s2_rt$Parameter == "mousetype"] <- "Device (T-M)"
+
+s2_rt$Parameter <- factor(s2_rt$Parameter, levels = c("Age", "Sex (F-M)",  "Hand (R-L)", "Device (T-M)", "Sleep", "Game (1~5)", "Vision (C-U)", "Comp"))
+
+s2_rt_plot <- s2_rt %>%
+  ggplot(aes(x = Mean, y = Parameter)) + 
+  geom_vline(xintercept = 0, color = "lightgrey") +
+  geom_point(size = 0.75) + 
+  geom_errorbar(aes(xmin = Lower_95, xmax = Upper_95), width = 0.1) +
+  th + 
+  labs(x = "Reaction Time (ms)",  y = "") +
+  theme(axis.title.y = element_blank())
+print(s2_rt_plot)
+
+```
+
+
+## RT - NO EXP
+```{r}
+
+fit_rt_study2_no <- fit_stan(stan_study2_no, study2, study2$RT, 
+                   inter = FALSE, poly = FALSE, hand = FALSE, study2_no = TRUE,
+                   n_iter = 8000)
+
+params_rt_study2_no <- fit_rt_study2_no$params
+
+rt_study2_summary_no <- get_ci(params_rt_study2_no, c("Age", "Sex")) %>%
+  mutate(Parameter = factor(Parameter, 
+                           levels = c("Sex", "Age"))) %>%
+  arrange(Parameter)
+write.csv(rt_study2_summary_no, "rt_study2_summary_no.csv")
+read.csv("rt_study2_summary_no.csv")
+
+```
+
+```{r}
+rt_study2_summary_no <- read.csv("rt_study2_summary_no.csv")
+
+rt_study2_summary_no <- rt_study2_summary_no %>%
+  mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+
+rt_study2_forest_no <- ggplot(rt_study2_summary_no, aes(y = Parameter, x = Mean, xmin = Lower_95, xmax = Upper_95)) +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = "gray50") +
+  geom_pointrange(size = 0.05) +
+  theme_minimal() +
+  theme( 
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(hjust = 0),
+    plot.margin = margin(20, 40, 20, 20)
+  ) +
+  labs(
+    x = "RT Effect (ms)",
+    y = ""
+  )
+print(rt_study2_forest_no)
+ggsave("rt_study2_forest_no.jpg", rt_study2_forest_no, height = 7)
+
+print(rt_study2_summary_no)
+
+
+s2_rt_no <- read.csv("rt_study2_summary_no.csv") %>% mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+
+s2_rt_no$Parameter[s2_rt_no$Parameter == "Sex"] <- "Sex"
+
+
+s2_rt_no$Parameter <- factor(s2_rt_no$Parameter, levels = c("Age", "Sex"))
+
+s2_rt_plot_no <- s2_rt_no %>%
+  ggplot(aes(x = Mean, y = Parameter)) + 
+  geom_vline(xintercept = 0, color = "lightgrey") +
+  geom_point(size = 0.75) + 
+  geom_errorbar(aes(xmin = Lower_95, xmax = Upper_95), width = 0.1) +
+  th + 
+  labs(x = "Reaction Time (ms)",  y = "") +
+  theme(axis.title.y = element_blank())
+print(s2_rt_plot_no)
+
+ggsave("s2_rt_plot_no.png", plot = s2_rt_plot_no, width = 2.55, height = 2.55, units = "in")
+```
+
+```{r}
+ data.frame(
+  beta_Age = c(fit_rt_study2$params$beta_Age, fit_rt_study2_no$params$beta_Age),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_rt_study2$params$beta_Age), 
+                length(fit_rt_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Age", 
+       y = "Density",
+       title = paste("Age Effect for Reaction Time (P(difference) = ",
+                     round(mean(fit_rt_study2$params$beta_Age > fit_rt_study2_no$params$beta_Age ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+ data.frame(
+  beta_Age = c(fit_rt_study2$params$beta_Sex, fit_rt_study2_no$params$beta_Sex),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_rt_study2$params$beta_Age), 
+                length(fit_rt_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Sex", 
+       y = "Density",
+       title = paste("Sex Effect for Reaction Time (P(difference) = ",
+                     round(mean(fit_rt_study2$params$beta_Sex < fit_rt_study2_no$params$beta_Sex ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+```
+
+
+## MT
+```{r}
+fit_mt_study2 <- fit_stan(stan_study2,  study2, study2$MT, 
+                          inter = FALSE, poly = FALSE, hand = FALSE, 
+                          study2 = TRUE, n_iter = 8000)
+
+params_mt_study2 <- fit_mt_study2$params
+
+mt_study2_summary <- get_ci(params_mt_study2, param_names_study2) %>%
+mutate(Parameter = factor(Parameter, 
+                           levels = c("Sleep",  "ComputerUsage",  "vision", "videogames",
+                                      "mousetype", "Handedness", "Sex", "Age"))) %>%
+  arrange(Parameter)
+
+write.csv(mt_study2_summary, "mt_study2_summary.csv")
+```
+
+```{r}
+mt_study2_summary <- mt_study2_summary %>%
+  mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+mt_study2_summary
+
+s2_mt <- read.csv("mt_study2_summary.csv") %>% mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+s2_mt$Parameter[s2_mt$Parameter == "vision"] <- "Vision (C-U)"
+s2_mt$Parameter[s2_mt$Parameter == "ComputerUsage"] <- "Comp"
+s2_mt$Parameter[s2_mt$Parameter == "Handedness"] <- "Hand (R-L)"
+s2_mt$Parameter[s2_mt$Parameter == "Sex"] <- "Sex (F-M)"
+s2_mt$Parameter[s2_mt$Parameter == "videogames"] <- "Game (1~5)"
+s2_mt$Parameter[s2_mt$Parameter == "mousetype"] <- "Device (T-M)"
+
+s2_mt$Parameter <- factor(s2_mt$Parameter, levels = c("Age", "Sex (F-M)",  "Hand (R-L)", "Device (T-M)", "Sleep", "Game (1~5)", "Vision (C-U)", "Comp"))
+s2_mt
+s2_mt_plot <- s2_mt %>%
+  ggplot(aes(y = Parameter, x = Mean)) + 
+  geom_vline(xintercept = 0, color = "lightgrey") +
+  geom_point(size = 0.75) + 
+  geom_errorbar(aes(xmin = Lower_95, xmax = Upper_95), width = 0.1) +
+  th + 
+  labs(x = "Movement Time (ms)",  y = "") +
+  theme(axis.title.y = element_blank())
+print(s2_mt_plot)
+```
+
+
+## MT - NO EXP
+```{r}
+
+fit_mt_study2_no <- fit_stan(stan_study2_no,  study2, study2$MT, 
+                          inter = FALSE, poly = FALSE, hand = FALSE, 
+                          study2_no = TRUE, n_iter = 8000)
+
+params_mt_study2_no <- fit_mt_study2_no$params
+mt_study2_summary_no <- get_ci(params_mt_study2_no, c("Age", "Sex")) %>%
+  mutate(Parameter = factor(Parameter, 
+                           levels = c("Sex", "Age"))) %>%
+  arrange(Parameter)
+
+write.csv(mt_study2_summary_no, "mt_study2_summary_no.csv")
+```
+
+```{r}
+mt_study2_summary_no <- mt_study2_summary_no %>%
+  mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+mt_study2_forest_no <- ggplot(mt_study2_summary_no, aes(y = Parameter, x = Mean, 
+                                                  xmin = Lower_95, xmax = Upper_95)) +
+  geom_vline(xintercept = 0, linetype = 'dashed', color = "gray50") +
+  geom_pointrange(size = 0.05) +
+  theme_minimal() +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(hjust = 0),
+    plot.margin = margin(20, 40, 20, 20)
+  ) +
+  labs(
+    x = "MT Effect (ms)",
+    y = ""
+  )
+
+ggsave("mt_study2_forest_no.jpg", mt_study2_forest_no, height = 7)
+print(mt_study2_forest_no)
+mt_study2_summary_no
+
+s2_mt_no <- read.csv("mt_study2_summary_no.csv") %>% mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+
+s2_mt_no$Parameter[s2_mt_no$Parameter == "Sex"] <- "Sex"
+
+
+s2_mt_no$Parameter <- factor(s2_mt_no$Parameter, levels = c("Age", "Sex"))
+
+s2_mt_plot_no <- s2_mt_no %>%
+  ggplot(aes(y = Parameter, x = Mean)) + 
+  geom_vline(xintercept = 0, color = "lightgrey") +
+  geom_point(size = 0.75) + 
+  geom_errorbar(aes(xmin = Lower_95, xmax = Upper_95), width = 0.1) +
+  th + 
+  labs(x = "Movement Time (ms)",  y = "") +
+  theme(axis.title.y = element_blank())
+print(s2_mt_plot_no)
+
+ggsave("s2_mt_plot_no.png", plot = s2_mt_plot_no, width = 2.55, height = 2.55, units = "in")
+```
+
+```{r}
+ data.frame(
+  beta_Age = c(fit_mt_study2$params$beta_Age, fit_mt_study2_no$params$beta_Age),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_mt_study2$params$beta_Age), 
+                length(fit_mt_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Age", 
+       y = "Density",
+       title = paste("Age Effect for Movement Time (P(difference) = ",
+                     round(mean(fit_mt_study2$params$beta_Age < fit_mt_study2_no$params$beta_Age ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+ data.frame(
+  beta_Age = c(fit_mt_study2$params$beta_Sex, fit_mt_study2_no$params$beta_Sex),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_mt_study2$params$beta_Age), 
+                length(fit_mt_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Sex", 
+       y = "Density",
+       title = paste("Sex Effect for Movement Time (P(difference) = ",
+                     round(mean(fit_mt_study2$params$beta_Sex < fit_mt_study2_no$params$beta_Sex ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+```
+
+## HA
+```{r}
+fit_ha_study2 <- fit_stan(
+  stan_study2, study2, study2$HA,
+  inter = FALSE, poly = FALSE, hand = FALSE, 
+  study2 = TRUE, n_iter = 8000)
+
+params_ha_study2 <- fit_ha_study2$params
+ha_study2_summary <- get_ci(params_ha_study2, param_names_study2) 
+
+write.csv(ha_study2_summary, "ha_study2_summary.csv")
+```
+
+```{r}
+s2_ha <- read.csv("ha_study2_summary.csv") %>% mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+s2_ha$Parameter[s2_ha$Parameter == "vision"] <- "Vision (C-U)"
+s2_ha$Parameter[s2_ha$Parameter == "ComputerUsage"] <- "Comp"
+s2_ha$Parameter[s2_ha$Parameter == "Handedness"] <- "Hand (R-L)"
+s2_ha$Parameter[s2_ha$Parameter == "Sex"] <- "Sex (F-M)"
+s2_ha$Parameter[s2_ha$Parameter == "videogames"] <- "Game (1~5)"
+s2_ha$Parameter[s2_ha$Parameter == "mousetype"] <- "Device (T-M)"
+
+s2_ha$Parameter <- factor(s2_ha$Parameter, levels = c("Age", "Sex (F-M)",  "Hand (R-L)", "Device (T-M)", "Sleep", "Game (1~5)", "Vision (C-U)", "Comp"))
+s2_ha
+s2_ha_plot <- s2_ha %>%
+  ggplot(aes(y = Parameter, x = Mean)) + 
+  geom_vline(xintercept = 0, color = "lightgrey") +
+  geom_point(size = 0.75) + 
+  geom_errorbar(aes(xmin = Lower_95, xmax = Upper_95), width = 0.1) +
+  th + 
+  labs(x = "Move Angle SD (\u00B0)",  y = "") +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 10))
+print(s2_ha_plot)
+
+```
+
+
+## HA - NO EXP
+```{r}
+fit_ha_study2_no <- fit_stan(
+  stan_study2_no, study2, study2$HA,
+  inter = FALSE, poly = FALSE, hand = FALSE, 
+  study2_no = TRUE, n_iter = 8000)
+
+
+params_ha_study2_no <- fit_ha_study2_no$params
+ha_study2_summary_no <- get_ci(params_ha_study2_no, c("Age", "Sex")) %>%
+  mutate(Parameter = factor(Parameter, 
+                           levels = c("Sex", "Age"))) %>%
+  arrange(Parameter)
+
+write.csv(ha_study2_summary_no, "ha_study2_summary_no.csv")
+```
+
+```{r}
+s2_ha_no <- read.csv("ha_study2_summary_no.csv") %>% mutate(across(c(Mean, Lower_95, Upper_95), 
+                ~ifelse(Parameter == "Sex", -1 * ., .)))
+
+s2_ha_no$Parameter[s2_ha_no$Parameter == "Sex"] <- "Sex"
+
+s2_ha_no$Parameter <- factor(s2_ha_no$Parameter, levels = c("Age", "Sex"))
+s2_ha_no
+s2_ha_plot_no <- s2_ha_no %>%
+  ggplot(aes(y = Parameter, x = Mean)) + 
+  geom_vline(xintercept = 0, color = "lightgrey") +
+  geom_point(size = 0.75) + 
+  geom_errorbar(aes(xmin = Lower_95, xmax = Upper_95), width = 0.1) +
+  th + 
+  labs(x = "Move Angle SD (\u00B0)",  y = "") +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 10))
+print(s2_ha_plot_no)
+
+ggsave("s2_ha_plot_no.png", plot = s2_ha_plot_no, width = 2.55, height = 2.55, units = "in")
+```
+
+```{r}
+ data.frame(
+  beta_Age = c(fit_ha_study2$params$beta_Age, fit_ha_study2_no$params$beta_Age),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_ha_study2$params$beta_Age), 
+                length(fit_ha_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Age", 
+       y = "Density",
+       title = paste("Age Effect for Movement Precision (P(difference) = ",
+                     round(mean(fit_ha_study2$params$beta_Age < fit_ha_study2_no$params$beta_Age), 2), ")", sep = ""),
+       fill = "Model") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+data.frame(
+ beta_Age = c(fit_ha_study2$params$beta_Sex, fit_ha_study2_no$params$beta_Sex),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_ha_study2$params$beta_Age), 
+                length(fit_ha_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Sex", 
+       y = "Density",
+       title = paste("Sex Effect for Movement Precision (P(difference) = ",
+                     round(mean(fit_ha_study2$params$beta_Sex < fit_ha_study2_no$params$beta_Sex), 2), ")", sep = ""),
+       fill = "Model") +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+```
+
+```{r}
+mean(fit_rt_study2$params$beta_Age > fit_rt_study2_no$params$beta_Age )
+
+mean(fit_rt_study2$params$beta_Sex > fit_rt_study2_no$params$beta_Sex)
+
+mean(fit_mt_study2$params$beta_Age > fit_mt_study2_no$params$beta_Age )
+
+mean(fit_mt_study2$params$beta_Sex > fit_mt_study2_no$params$beta_Sex)
+
+mean(fit_ha_study2$params$beta_Age > fit_ha_study2_no$params$beta_Age )
+
+mean(fit_ha_study2$params$beta_Sex > fit_ha_study2_no$params$beta_Sex)
+
+
+```
+
+```{r}
+ data.frame(
+  beta_Age = c(fit_ha_study2$params$beta_Sex, fit_ha_study2_no$params$beta_Sex),
+  Model = rep(c("With", "Without Experimental Factors"), 
+              c(length(fit_ha_study2$params$beta_Age), 
+                length(fit_ha_study2_no$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Beta Sex", 
+       y = "Density",
+       title = "Sex Effect for Movement Precision",
+       fill = "Model") +
+  # theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("With" = "#1f77b4", 
+                               "Without Experimental Factors" = "#ff7f0e"))
+
+```
+
+# Responses Control
+```{r}
+fit_stan_hier_controls <- function(df,
+                                   responses,        
+                                   control = 1,       
+                                   study_col = "Study",
+                                   age_col   = "Age",
+                                   sex_col   = "Sex",
+                                   trials_col = "NTrials",
+                                   n_iter = 8000,
+                                   n_chain = 4,
+                                   seed = 123,
+                                   adapt_delta = NULL,      
+                                   max_treedepth = NULL) {  
+
+  stopifnot(length(responses) == 3)
+  if (!control %in% 1:3) stop("control must be 1, 2, or 3")
+
+  outcome <- responses[control]
+  controls <- responses[-control]  
+
+  needed <- c(study_col, age_col, sex_col, trials_col, outcome, controls)
+  missing_cols <- setdiff(needed, names(df))
+  if (length(missing_cols) > 0) {
+    if (trials_col %in% missing_cols) {
+      missing_cols <- setdiff(missing_cols, trials_col)
+    }
+  }
+  if (length(missing_cols) > 0) {
+    stop("Missing columns in df: ", paste(missing_cols, collapse = ", "))
+  }
+
+  dat <- data.frame(
+    Study = df[[study_col]],
+    Age   = df[[age_col]],
+    Sex   = df[[sex_col]],
+    Res   = df[[outcome]],
+    C1    = df[[controls[1]]],
+    C2    = df[[controls[2]]],
+    NTrials = if (trials_col %in% names(df)) df[[trials_col]] else 1
+  )
+
+  if (!is.numeric(dat$Sex)) dat$Sex <- as.numeric(dat$Sex)
+  if (!is.numeric(dat$NTrials)) dat$NTrials <- as.numeric(dat$NTrials)
+  dat <- stats::na.omit(dat)
+
+  study_factor <- factor(dat$Study)
+  study_idx <- as.integer(study_factor)
+  J <- nlevels(study_factor)
+
+  data_list <- list(
+    N = nrow(dat),
+    J = J,
+    study = study_idx,
+    Res = as.vector(dat$Res),
+    Age = as.vector(dat$Age),
+    Sex = as.vector(dat$Sex),
+    C1  = as.vector(dat$C1),
+    C2  = as.vector(dat$C2),
+    n_trials = pmax(1e-8, as.vector(dat$NTrials))  
+  )
+
+  stan_code <- "
+  data {
+    int<lower=0> N;
+    int<lower=0> J;
+    array[N] int<lower=1, upper=J> study;
+    vector[N] Res;
+    vector[N] Age;
+    vector[N] Sex;
+    vector[N] C1;
+    vector[N] C2;
+    vector<lower=0>[N] n_trials;
+  }
+  parameters {
+    real alpha;
+    real beta_Age;
+    real beta_Sex;
+    real beta_C1;
+    real beta_C2;
+    real<lower=0> sigma;
+
+    vector[J] u_alpha;
+    vector[J] u_beta_Age;
+    vector[J] u_beta_Sex;
+    vector[J] u_beta_C1;
+    vector[J] u_beta_C2;
+
+    real<lower=0> sigma_alpha;
+    real<lower=0> sigma_beta_Age;
+    real<lower=0> sigma_beta_Sex;
+    real<lower=0> sigma_beta_C1;
+    real<lower=0> sigma_beta_C2;
+  }
+  model {
+    // Priors (mirroring your original style)
+    alpha ~ normal(500, 500);
+    beta_Age ~ normal(0, 5);
+    beta_Sex ~ normal(0, 50);
+    beta_C1  ~ normal(0, 10);
+    beta_C2  ~ normal(0, 10);
+    sigma ~ cauchy(0, 100);
+
+    u_alpha ~ normal(0, sigma_alpha);
+    u_beta_Age ~ normal(0, sigma_beta_Age);
+    u_beta_Sex ~ normal(0, sigma_beta_Sex);
+    u_beta_C1  ~ normal(0, sigma_beta_C1);
+    u_beta_C2  ~ normal(0, sigma_beta_C2);
+
+    sigma_alpha ~ cauchy(0, 500);
+    sigma_beta_Age ~ cauchy(0, 2.5);
+    sigma_beta_Sex ~ cauchy(0, 20);
+    sigma_beta_C1  ~ cauchy(0, 10);
+    sigma_beta_C2  ~ cauchy(0, 10);
+
+    for (n in 1:N) {
+      real mu = alpha + u_alpha[study[n]]
+              + (beta_Age + u_beta_Age[study[n]]) * Age[n]
+              + (beta_Sex + u_beta_Sex[study[n]]) * Sex[n]
+              + (beta_C1  + u_beta_C1[study[n]]) * C1[n]
+              + (beta_C2  + u_beta_C2[study[n]]) * C2[n];
+      real sigma_adj = sigma / sqrt(n_trials[n]);
+      Res[n] ~ normal(mu, sigma_adj);
+    }
+  }
+  generated quantities {
+    vector[N] log_lik;
+    vector[N] y_rep;
+
+    for (n in 1:N) {
+      real mu = alpha + u_alpha[study[n]]
+              + (beta_Age + u_beta_Age[study[n]]) * Age[n]
+              + (beta_Sex + u_beta_Sex[study[n]]) * Sex[n]
+              + (beta_C1  + u_beta_C1[study[n]]) * C1[n]
+              + (beta_C2  + u_beta_C2[study[n]]) * C2[n];
+      real sigma_adj = sigma / sqrt(n_trials[n]);
+      log_lik[n] = normal_lpdf(Res[n] | mu, sigma_adj);
+      y_rep[n] = normal_rng(mu, sigma_adj);
+    }
+  }"
+
+  model_file <- tempfile(fileext = ".stan")
+  writeLines(stan_code, model_file)
+  mod <- cmdstanr::cmdstan_model(model_file)
+
+  sample_args <- list(
+    data = data_list,
+    iter_warmup = n_iter / 2,
+    iter_sampling = n_iter / 2,
+    chains = n_chain,
+    parallel_chains = max(1, floor(n_chain / 2)),
+    seed = seed,
+    refresh = 500,
+    save_cmdstan_config = TRUE
+  )
+  if (!is.null(adapt_delta)) sample_args$adapt_delta <- adapt_delta
+  if (!is.null(max_treedepth)) sample_args$max_treedepth <- max_treedepth
+
+  fit <- do.call(mod$sample, sample_args)
+
+  draws <- fit$draws(format = "draws_matrix")
+  pnames <- dimnames(draws)[[2]]
+
+  get_scalar <- function(nm) {
+    idx <- which(pnames == nm)
+    if (length(idx)) as.vector(draws[, idx]) else NULL
+  }
+
+  summarize_scalar <- function(samples) {
+    if (is.null(samples)) return(NULL)
+    c(q2.5 = stats::quantile(samples, 0.025),
+      mean = mean(samples),
+      q97.5 = stats::quantile(samples, 0.975))
+  }
+
+  summ_table <- do.call(rbind, list(
+    alpha      = summarize_scalar(get_scalar("alpha")),
+    beta_Age   = summarize_scalar(get_scalar("beta_Age")),
+    beta_Sex   = summarize_scalar(get_scalar("beta_Sex")),
+    beta_C1    = summarize_scalar(get_scalar("beta_C1")),
+    beta_C2    = summarize_scalar(get_scalar("beta_C2")),
+    sigma      = summarize_scalar(get_scalar("sigma"))
+  ))
+  coef_summary <- if (!is.null(summ_table)) {
+    data.frame(term = rownames(summ_table), summ_table, row.names = NULL, check.names = FALSE)
+  } else NULL
+
+  diagnostics_summary <- fit$summary()
+  sampler_diag <- fit$diagnostic_summary()
+
+  ll_idx <- grep("^log_lik\\[", pnames)
+  loo_result <- NULL
+  if (length(ll_idx) > 0) {
+    ll_mat <- matrix(NA_real_, nrow = nrow(draws), ncol = length(ll_idx))
+    for (i in seq_along(ll_idx)) ll_mat[, i] <- as.vector(draws[, ll_idx[i]])
+    loo_result <- loo::loo(ll_mat)
+  } else {
+    warning("log_lik not found; LOO not computed.")
+  }
+
+  cat("\n--- Model Diagnostics ---\n")
+  cat("Outcome:", outcome, "\n")
+  cat("Controls:", paste(controls, collapse = ", "), "\n")
+  cat("Max R-hat:", round(max(diagnostics_summary$rhat, na.rm = TRUE), 3), "\n")
+  cat("Min n_eff:", round(min(diagnostics_summary$ess_bulk, na.rm = TRUE), 0), "\n")
+  cat("Divergences:", sum(sampler_diag$num_divergent), "\n")
+  if (!is.null(loo_result)) {
+    cat("LOO-IC:", round(loo_result$estimates["looic", "Estimate"], 2), "\n")
+    cat("p_loo:", round(loo_result$estimates["p_loo", "Estimate"], 2), "\n")
+  }
+
+  unlink(model_file)
+
+  list(
+    params = list( 
+      alpha    = get_scalar("alpha"),
+      beta_Age = get_scalar("beta_Age"),
+      beta_Sex = get_scalar("beta_Sex"),
+      beta_C1  = get_scalar("beta_C1"),
+      beta_C2  = get_scalar("beta_C2"),
+      sigma    = get_scalar("sigma")
+    ),
+    coef_summary = coef_summary,
+    fit_cmdstan  = fit,
+    loo          = loo_result,
+    diagnostics  = list(
+      max_rhat = max(diagnostics_summary$rhat, na.rm = TRUE),
+      min_neff = min(diagnostics_summary$ess_bulk, na.rm = TRUE),
+      num_divergent = sum(sampler_diag$num_divergent)
+    ),
+    data_used = list(
+      outcome   = outcome,
+      controls  = controls,
+      study_map = levels(study_factor),
+      N         = data_list$N,
+      J         = data_list$J
+    )
+  )
+}
+
+```
+
+## RT
+```{r}
+responses <- c("RT","MT","HA")
+
+fit_RT_control <- fit_stan_hier_controls(combined_data, responses, control = 1)
+
+fit_RT_control$coef_summary
+
+ data.frame(
+  beta_Age = c(fit_rt$params$beta_Age, fit_RT_control$params$beta_Age),
+  Model = rep(c("Without", "With Control"), 
+              c(length(fit_rt$params$beta_Age), 
+                length(fit_RT_control$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Age Effect", 
+       y = "Density",
+       title = paste("Age Effect for Reaction Time (P(difference) = ",
+                     round(mean(fit_rt$params$beta_Age > fit_RT_control$params$beta_Age ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("Without" = "#1f77b4", 
+                               "With Control" = "#ff7f0e"))
+
+
+
+ data.frame(
+  beta_Age = c(fit_rt$params$beta_Sex, fit_RT_control$params$beta_Sex),
+  Model = rep(c("Without", "With Control"), 
+              c(length(fit_rt$params$beta_Age), 
+                length(fit_RT_control$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Sex Effect", 
+       y = "Density",
+       title = paste("Sex Effect for Reaction Time (P(difference) = ",
+                     round(mean(fit_rt$params$beta_Sex > fit_RT_control$params$beta_Sex ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("Without" = "#1f77b4", 
+                               "With Control" = "#ff7f0e"))
+
+```
+
+## MT
+
+```{r}
+fit_MT_control <- fit_stan_hier_controls(combined_data, responses, control = 2)
+
+ data.frame(
+  beta_Age = c(fit_mt$params$beta_Age, fit_MT_control$params$beta_Age),
+  Model = rep(c("Without", "With Control"), 
+              c(length(fit_mt$params$beta_Age), 
+                length(fit_MT_control$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Age Effect", 
+       y = "Density",
+       title = paste("Age Effect for Movement Time (P(difference) = ",
+                     round(mean(fit_mt$params$beta_Age > fit_MT_control$params$beta_Age ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("Without" = "#1f77b4", 
+                               "With Control" = "#ff7f0e"))
+
+
+
+ data.frame(
+  beta_Age = c(fit_mt$params$beta_Sex, fit_MT_control$params$beta_Sex),
+  Model = rep(c("Without", "With Control"), 
+              c(length(fit_mt$params$beta_Age), 
+                length(fit_MT_control$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Sex Effect", 
+       y = "Density",
+       title = paste("Sex Effect for Movement Time (P(difference) = ",
+                     round(mean(fit_mt$params$beta_Sex > fit_MT_control$params$beta_Sex ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("Without" = "#1f77b4", 
+                               "With Control" = "#ff7f0e"))
+```
+
+
+## HA
+```{r}
+responses
+fit_HA_control <- fit_stan_hier_controls(combined_data, responses, control = 3)
+fit_HA_control$coef_summary
+
+ data.frame(
+  beta_Age = c(fit_ha$params$beta_Age, fit_HA_control$params$beta_Age),
+  Model = rep(c("Without", "With Control"), 
+              c(length(fit_ha$params$beta_Age), 
+                length(fit_HA_control$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Age Effect", 
+       y = "Density",
+       title = paste("Age Effect for Movement Precision (P(difference) = ",
+                     round(mean(fit_ha$params$beta_Age > fit_HA_control$params$beta_Age ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("Without" = "#1f77b4", 
+                               "With Control" = "#ff7f0e"))
+
+
+
+ data.frame(
+  beta_Age = c(fit_ha$params$beta_Sex, fit_HA_control$params$beta_Sex),
+  Model = rep(c("Without", "With Control"), 
+              c(length(fit_ha$params$beta_Age), 
+                length(fit_HA_control$params$beta_Age)))
+) %>% ggplot(., aes(x = beta_Age, fill = Model)) +
+  geom_density(alpha = 0.7) +
+  labs(x = "Sex Effect", 
+       y = "Density",
+       title = paste("Sex Effect for Movement Precision (P(difference) = ",
+                     round(mean(fit_ha$params$beta_Sex > fit_HA_control$params$beta_Sex ), 2), ")", sep = ""),
+       fill = "Model") +
+  theme_minimal() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("Without" = "#1f77b4", 
+                               "With Control" = "#ff7f0e"))
+```
+
+# Leave Study 2
+```{r}
+df2 = bind_rows(
+  kinarm,
+  nemo,
+  cam
+) %>% mutate(Study = factor(Study, ordered = TRUE), Sex = as.numeric(Sex))
+df2
+```
+
+## RT
+```{r}
+fit_rt_loo2 <- fit_stan(stan_code, df2, df2$RT, inter = FALSE, poly = FALSE,
+                        hand = FALSE)
+
+summary_rt_loo2 <- summary_overall_effects(fit_rt_loo2, df2, 
+                                                      levels = c('Overall', "Study 4", 
+                                                      "Study 3", "Study 2", "Study 1"))
+write.csv(summary_rt_loo2, "study_estimates_summary_rt_loo2.csv")
+summary_rt_loo2
+summary_rt_loo2 <- summary_rt_loo2 %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_rt_loo2
+
+age_forest_rt_loo2 <- create_forest_plot(summary_rt_loo2, 
+                                         "Age", "Age_lower", "Age_upper", "ms/year")
+age_forest_rt_loo2
+sex_forest_rt_loo2 <- create_forest_plot(summary_rt_loo2, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_rt_loo2
+```
+
+## MT
+```{r}
+fit_mt_loo2 <- fit_stan(stan_code, df2, df2$MT, inter = FALSE, poly = FALSE, hand = FALSE)
+
+summary_mt_loo2 <- summary_overall_effects(fit_mt_loo2, df2, 
+                                       levels = c('Overall', "Study 4", 
+                                                  "Study 3", "Study 2", "Study 1"))
+write.csv(summary_mt_loo2, "study_estimates_summary_mt_loo2.csv")
+summary_mt_loo2
+summary_mt_loo2 <- summary_mt_loo2 %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_mt_loo2
+
+age_forest_mt_loo2 <- create_forest_plot(summary_mt_loo2, 
+                                         "Age", "Age_lower", "Age_upper", "ms/year")
+age_forest_mt_loo2
+sex_forest_mt_loo2 <- create_forest_plot(summary_mt_loo2, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_mt_loo2
+```
+## HA
+```{r}
+fit_ha_loo2 <- fit_stan(stan_code, df2, df2$HA, inter = FALSE, poly = FALSE, hand = FALSE)
+
+summary_ha_loo2 <- summary_overall_effects(fit_ha_loo2, df2, 
+                                       levels = c('Overall', "Study 4", 
+                                                  "Study 3", "Study 2", "Study 1"))
+write.csv(summary_ha_loo2, "study_estimates_summary_ha_loo2.csv")
+summary_ha_loo2
+summary_ha_loo2 <- summary_ha_loo2 %>% 
+  mutate(
+    Sex = -1 * Sex,
+    Sex_lower = -1 * Sex_lower,
+    Sex_upper = -1 * Sex_upper
+  )
+summary_ha_loo2
+
+age_forest_ha_loo2 <- create_forest_plot(summary_ha_loo2, 
+                                         "Age", "Age_lower", "Age_upper", "ms/year")
+age_forest_ha_loo2
+sex_forest_ha_loo2 <- create_forest_plot(summary_ha_loo2, "Sex", "Sex_lower", "Sex_upper", 
+                                    "\u0394 ms (F-M)")
+sex_forest_ha_loo2
+```
+
